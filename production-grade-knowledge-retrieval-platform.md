@@ -264,10 +264,76 @@ export interface Chunk {
 ``` text
 chunkId = hash(
   documentVersionId +
-  normalizedContent +
-  chunkIndex
+  normalizedContent
 )
 ```
+
+为什么不能含 `chunkIndex`：
+
+-   `chunkIndex` 是数组位置索引。任何一次插入 / 删除 / 重切分，
+    都会导致后续所有 chunk 的 ID 漂移，直接摧毁"稳定 ID"与"增量更新"。
+
+更优方案（二选一）：
+
+``` text
+1. 内容哈希：hash(documentVersionId + normalizedContent)
+   同一 document 内内容完全相同的 chunk 会碰撞，需去重合并，
+   用 contentHash 判断是否已存在，命中则复用。
+
+2. 结构定位哈希：hash(documentVersionId + sectionPath)
+   用标题 / 章节路径而非数组索引，兼顾稳定性与可定位性。
+```
+
+推荐：用 `contentHash` 字段（Chunk 上已有）做增量 diff 判据，
+用结构路径或内容哈希做稳定 ID，不要用 `chunkIndex`。
+
+### 5.4 Tenant
+
+``` ts
+export interface Tenant {
+  id: string;
+  name: string;
+  plan: "free" | "pro" | "enterprise";
+
+  // 索引 / 检索配额
+  limits: {
+    maxDocuments: number;
+    maxChunks: number;
+    maxEmbeddingsPerDay: number;
+    maxQueriesPerMinute: number;
+  };
+
+  status: "active" | "suspended" | "deleted";
+  createdAt: Date;
+}
+```
+
+### 5.5 Job / IndexJob
+
+``` ts
+export interface Job {
+  id: string;
+  tenantId: string;
+  type:
+    | "index_document"
+    | "reindex_document"
+    | "delete_document"
+    | "embedding_upgrade"
+    | "chunk_strategy_upgrade"
+    | "reconciliation";
+
+  status: "pending" | "processing" | "ready" | "failed";
+  payload: Record<string, unknown>;
+  attempts: number;
+  maxAttempts: number;
+  error?: string;
+  createdAt: Date;
+  updatedAt: Date;
+}
+```
+
+`Job` 是异步任务的工作单元，`IndexStatus` 是更细粒度的结果状态，
+二者配合：一个 `Job` 可能驱动多个 chunk 的 `IndexStatus` 变化。
 
 ------------------------------------------------------------------------
 
@@ -325,6 +391,43 @@ export interface IndexStatus {
 ```
 
 这样某一路失败后可以单独重试。
+
+### 7.1 索引一致性：Outbox + Reconciliation
+
+PostgreSQL 是 Source of Truth，派生索引（Vector / Keyword / Graph）是
+最终一致副本。多路写入必须保证"至少最终一致 + 可对账"：
+
+``` text
+PostgreSQL 事务内:
+  1. 更新 Chunk / IndexStatus（source of truth）
+  2. 写入 outbox 表（同一事务）
+
+Worker:
+  1. 读 outbox 事件
+  2. 幂等写入派生索引（Qdrant / OpenSearch / Neo4j）
+  3. 成功后标记 outbox 已消费 + IndexStatus = ready
+```
+
+关键机制：
+
+``` text
+1. Outbox Pattern
+   业务变更与索引事件在同一 PG 事务提交，避免丢事件。
+
+2. Idempotent Write
+   索引写入按 chunkId 幂等（upsert / replace），
+   重复消费同一条 outbox 事件不会产生脏数据。
+
+3. Reconciliation Job（对账 / 兜底）
+   定时扫描 IndexStatus != ready 的记录，重新投递事件；
+   也可 diff PG 与派生索引的 ID 集合，补写缺失、清理多余。
+
+4. Dead Letter Queue（死信）
+   重试超限的事件进入 DLQ，人工排查，不阻塞主队列。
+```
+
+这样 IndexStatus 的 `pending/processing/ready/failed` 不只是状态标签，
+而是对账循环的驱动信号。
 
 ------------------------------------------------------------------------
 
@@ -522,6 +625,18 @@ Check Entity References
 Delete Orphan Entity
 ```
 
+`Check Entity References` 的依据是显式的 **引用计数**：
+
+``` text
+每个 (:Chunk)-[:MENTIONS]->(:Entity) 对应一条计数，
+删除 document 时先减去该 document 的 MENTIONS，
+计数归零的 Entity 才允许删除；
+被多个 document 共享的 Entity 计数 > 0，保留。
+```
+
+不要依赖 `DETACH DELETE` 或"重新扫描全图判断引用"这种 O(N) 方式，
+用维护好的计数或关系枚举做到 O(1) 判定。
+
 ------------------------------------------------------------------------
 
 ## 13. Query Pipeline
@@ -541,6 +656,21 @@ Query
  ↓
 6. Generate
 ```
+
+复杂查询（`intent = multi_hop` / `comparison` / `aggregation`）不是
+单次静态管线能完成的，需要迭代检索：
+
+``` text
+while (evidence 不足以回答问题 && 未达最大轮数) {
+  plan = planner(question, accumulatedEvidence)
+  subResults = retrieve(plan)
+  accumulatedEvidence += subResults
+}
+answer = generate(question, accumulatedEvidence)
+```
+
+即上面 1~6 的单次管线是"简单查询快路径"，
+`multi_hop` 走 agentic loop（见第 28 章 Phase 8）。
 
 ### QueryAnalysis
 
@@ -617,6 +747,23 @@ export type RetrievalSource =
 ------------------------------------------------------------------------
 
 ## 16. Retriever 抽象
+
+``` ts
+export interface RetrievalQuery {
+  text: string;
+  tenantId: string;
+  embedding?: number[];
+  analysis?: QueryAnalysis;
+  plan?: RetrievalPlan;
+
+  filters?: {
+    documentIds?: string[];
+    metadata?: Record<string, unknown>;
+  };
+
+  topK: number;
+}
+```
 
 ``` ts
 export interface Retriever {
@@ -779,6 +926,29 @@ export interface Reranker {
 
 Graph Path 与 Chunk 统一转换为 `Evidence.content` 后参与重排。
 
+### 19.1 Reranker 选择与结构信息保留
+
+| 方案 | 精度 | 成本 / 延迟 | 适用 |
+| ---- | ---- | ----------- | ---- |
+| Cross-Encoder（bge-reranker / Cohere Rerank） | 高 | 低（略高于 embedding） | 默认选择，chunk 级重排 |
+| LLM Rerank（LLM 打分排序） | 最高 | 高（token 成本） | 少量候选精排，或需语义判断时 |
+
+注意事项：
+
+``` text
+Graph Path → Evidence.content 文本化会丢失图的结构信息
+（关系类型、方向、多跳路径）。
+
+补救：
+  1. 文本化时保留关系类型与方向，如
+     "(Person:张三)-[:RESPONSIBLE_FOR]->(Project:X)"
+  2. 重排时把 graph_path 的原始结构放进 Evidence.metadata，
+     供 Context Builder 优先保留，不参与纯文本重排打分。
+```
+
+职责分离：Reranker 只做文本相关性排序；结构完整性由 Context Builder
+的 Source Priority 兜底。
+
 ------------------------------------------------------------------------
 
 ## 20. Context Builder
@@ -849,6 +1019,39 @@ export interface Citation {
 }
 ```
 
+### 21.1 Citation 校验（防幻觉引用）
+
+LLM 可能输出不存在的 `[ev_xxx]`，或把引用 scope 张冠李戴。
+映射之后必须加一层校验：
+
+``` text
+LLM 输出引用标记 → 解析 evidenceId → 校验
+  ├── evidenceId 是否真实存在？        否 → 丢弃该引用
+  ├── 引用内容与 evidence 是否相关？    低 → 二次校验 / 丢弃
+  └── 无引用的断言 → 标记为"需复核 / 不可靠"
+```
+
+实现：
+
+``` ts
+export interface CitationVerifier {
+  verify(
+    answer: string,
+    citations: Citation[],
+    evidences: Evidence[]
+  ): Promise<VerificationResult>;
+}
+
+export interface VerificationResult {
+  validCitations: Citation[];
+  invalidCitations: Citation[];   // 引用不存在的证据
+  unsupportedClaims: string[];     // 无证据支撑的断言
+  faithfulnessScore?: number;      // 与 Evaluation 的 Faithfulness 对齐
+}
+```
+
+`Faithfulness` 指标与 Citation 校验共用同一套"断言 ↔ 证据"对齐逻辑。
+
 ------------------------------------------------------------------------
 
 ## 22. Evaluation
@@ -873,6 +1076,30 @@ export interface Citation {
 -   Entity Resolution Accuracy
 -   Relation Accuracy
 -   Path Accuracy
+
+### 22.1 Eval Dataset 与回归闭环
+
+指标本身没有价值，必须有一个可重复执行的评估闭环：
+
+``` text
+Eval Dataset（versioned，含 ground truth）
+  ├── 查询集（query）
+  ├── 黄金文档 / 黄金 chunk（retrieval ground truth）
+  └── 参考答案 / 关键事实（generation ground truth）
+
+Regression Pipeline
+  Query → Retrieve → Generate → 指标打分 → 写报告 → 与基线对比
+  ├── 每次改 embedding / chunk / rerank / prompt 都重跑
+  └── 指标显著回退则阻断合并（CI gate）
+```
+
+Ground truth 构建方式：
+
+-   Retrieval 标注：人工标注"哪些 chunk 是正确答案"，或从问答对反推
+-   Generation 标注：人工写参考答案，或用 `Faithfulness` 自动评测
+
+每个 Eval Dataset 绑定 `indexVersion + embeddingVersion`，
+索引升级后必须重新生成 ground truth 或重建基线。
 
 ------------------------------------------------------------------------
 
@@ -909,6 +1136,38 @@ Query
 -   cost
 -   retrieval plan
 
+### 23.1 稳定性：降级 / 熔断 / SLA
+
+| 能力 | 说明 |
+| ---- | ---- |
+| Timeout | 每个 Retriever 独立超时（见 RetrievalPlan.timeout），超时即降级 |
+| Circuit Breaker | 派生索引连续失败到阈值则熔断，该路返回空并标记 unhealthy |
+| Degrade | Graph 挂了走 Vector+Keyword；Reranker 挂了跳过重排 |
+| Retry | 幂等操作用指数退避重试；LLM 调用重试 + fallback 模型 |
+| Rate Limit | 按 tenant + 用户限流（见 Tenant.limits），超限返回 429 |
+| SLA | 定义 P95 延迟 / 可用性 / 错误率目标，面板对齐 |
+
+降级原则：
+
+``` text
+宁可返回"证据不足 / 降级结果"，也不要全链路失败。
+每条 evidence 标注来源与 index 健康状态，供生成层与用户透明感知。
+```
+
+### 23.2 成本与预算
+
+``` text
+成本 = embedding + LLM 生成 + rerank + 索引存储
+
+控制手段：
+  1. 按 tenant.limits 限制每日 embedding / query 数
+  2. 语义缓存命中则跳过 LLM（省生成成本）
+  3. cheap-first：Rule Router 命中则不走 LLM Router
+  4. 每次 query 记录 cost，按 tenant 聚合，超预算告警
+```
+
+Observability 里的 `cost` 字段随 trace 一起落库，是预算计费的依据。
+
 ------------------------------------------------------------------------
 
 ## 24. 多租户与缓存
@@ -939,6 +1198,54 @@ embeddingVersion
 ```
 
 避免索引升级后读取旧缓存。
+
+### 24.1 各存储的租户隔离实现
+
+| 存储 | 隔离方式 |
+| ---- | -------- |
+| PostgreSQL | tenantId 列 + 行级安全策略（RLS），所有查询强制注入 tenantId 过滤 |
+| Qdrant | collection-per-tenant（强隔离、易计费），或单 collection + tenantId payload filter（省资源、必须在 filter 强制） |
+| OpenSearch | 每条文档带 tenantId 字段 + filter，或 index-per-tenant |
+| Neo4j | 所有节点带 `tenantId` 属性；查询用 `tenantId` 过滤 |
+
+关键约束：
+
+``` text
+Entity 是"租户内共享、租户间隔离"：
+  - 同一 tenant 内可跨 document 共享 Entity
+  - 不同 tenant 间的同名 Entity 必须是不同节点
+```
+
+### 24.2 缓存策略
+
+| 层级 | 内容 | TTL | 失效触发 |
+| ---- | ---- | --- | -------- |
+| 语义缓存 | (query embedding → answer) | 短（分钟级） | 索引版本升级 |
+| 检索缓存 | (query → topK evidence) | 中 | 文档更新 / 删除 |
+| 嵌入缓存 | (contentHash → embedding) | 长（接近永久） | embedding 模型升级 |
+
+缓存读路径必须校验 `tenantId + indexVersion + embeddingVersion`，
+写路径在索引版本升级时主动失效或按 key 隔离。
+
+### 24.3 权限与访问控制 / PII
+
+``` text
+权限分层：
+  1. Tenant 级：租户间完全隔离（硬隔离）
+  2. Document 级：文档 ACL（哪些用户 / 组可读）
+  3. Row 级：PostgreSQL RLS + 派生索引 filter
+  4. Query 级：检索前注入 permission filter，禁止跨权限检索
+```
+
+检索时必须把 `allowedDocumentIds` / `allowedMetadata` 作为强制 filter
+注入每个 Retriever，避免越权返回。
+
+``` text
+PII / 敏感信息：
+  - Ingest 阶段做 PII 检测与脱敏（mask / redact），脱敏后才进索引
+  - 文档删除 / 租户删除触发派生索引级联清空（配合 §12 删除链路）
+  - 日志 / trace 不落敏感原文，只落 hash / token 计数
+```
 
 ------------------------------------------------------------------------
 
@@ -1069,6 +1376,22 @@ Interfaces
 
 不要让业务 Domain 被 LangChain 或具体数据库 SDK 绑定。
 
+Provider Adapter 最小接口：
+
+``` ts
+export interface LLMProvider {
+  chat(messages: ChatMessage[], opts?: LLMOptions): Promise<ChatMessage>;
+}
+
+export interface EmbeddingProvider {
+  embed(texts: string[]): Promise<number[][]>;
+  dimensions(): number;
+  model(): string;
+}
+```
+
+所有 Domain 代码依赖这两个接口，不 import 任何具体 SDK。
+
 ------------------------------------------------------------------------
 
 ## 28. 实施路线
@@ -1080,12 +1403,15 @@ Interfaces
 -   Document
 -   DocumentVersion
 -   Chunk
+-   Tenant + 租户隔离（RLS）
+-   Job / IndexJob + 队列
 -   PostgreSQL
 -   Upload
 -   Parse
 -   Normalize
 -   Chunk
 -   Delete
+-   Outbox + Reconciliation（索引一致性骨架）
 
 ### Phase 2：Vector RAG
 
