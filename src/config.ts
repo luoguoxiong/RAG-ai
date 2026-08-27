@@ -31,4 +31,6 @@ export const config = {
   defaultTopK: Number(process.env.DEFAULT_TOP_K ?? 6),
   // 图遍历默认最大跳数
   defaultMaxHops: Number(process.env.DEFAULT_MAX_HOPS ?? 2),
+  // Evaluation（§22）：指标回退容忍度，低于基线×(1-tolerance) 视为回归（CI gate）
+  evalBaselineTolerance: Number(process.env.EVAL_BASELINE_TOLERANCE ?? 0.1),
 };

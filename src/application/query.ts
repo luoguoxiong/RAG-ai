@@ -18,7 +18,7 @@ export interface SearchResult {
 }
 
 /** Context Builder（§20）：把 Evidence 序列化为带引用编号的提示词上下文。 */
-function buildMessages(query: string, evidence: Evidence[]): ChatMessage[] {
+export function buildMessages(query: string, evidence: Evidence[]): ChatMessage[] {
   const system = [
     "你是知识检索助手。仅依据下方【证据】回答用户问题。",
     "若证据不足，请明确说明「证据不足」，不要编造。",
@@ -42,6 +42,15 @@ function buildMessages(query: string, evidence: Evidence[]): ChatMessage[] {
   ];
 }
 
+/** 生成回答（Eval / 回归测试复用同一套 Context→LLM 链路） */
+export async function generateAnswer(
+  query: string,
+  evidence: Evidence[],
+): Promise<string> {
+  const reply = await createLLMProvider().chat(buildMessages(query, evidence));
+  return reply.content;
+}
+
 /**
  * Query 链路（§17 Query Pipeline）：
  * Retrieve → Evidence → Context → Generate → Citation。
@@ -53,7 +62,7 @@ export async function answerQuery(
 ): Promise<SearchResult> {
   const k = topK ?? config.defaultTopK;
   const evidence = await retrieveEvidence(tenantId, query, k);
-  const reply = await createLLMProvider().chat(buildMessages(query, evidence));
+  const answer = await generateAnswer(query, evidence);
 
   const citations: Citation[] = evidence.map((e, i) => ({
     index: i + 1,
@@ -65,7 +74,7 @@ export async function answerQuery(
 
   return {
     query,
-    answer: reply.content,
+    answer,
     citations,
     evidenceCount: evidence.length,
   };

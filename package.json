@@ -8,6 +8,7 @@
     "start": "tsx src/index.ts",
     "worker": "tsx src/worker.ts",
     "reconcile": "tsx src/reconcile.ts",
+    "eval:run": "tsx src/eval-run.ts",
     "build": "tsc -p tsconfig.json",
     "db:generate": "drizzle-kit generate",
     "db:migrate": "drizzle-kit migrate",

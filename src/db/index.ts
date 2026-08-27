@@ -41,7 +41,7 @@ export async function setupRls(): Promise<void> {
     DO $$
     DECLARE t text;
     BEGIN
-      FOREACH t IN ARRAY ARRAY['documents','document_versions','chunks','index_status','jobs','outbox','entities','entity_mentions','relations']
+      FOREACH t IN ARRAY ARRAY['documents','document_versions','chunks','index_status','jobs','outbox','entities','entity_mentions','relations','eval_datasets','eval_queries','eval_runs','eval_run_results']
       LOOP
         EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY', t);
         EXECUTE format('ALTER TABLE %I FORCE ROW LEVEL SECURITY', t);
