@@ -1,6 +1,10 @@
 import { createLLMProvider, type ChatMessage } from "../ai/llm.js";
 import { config } from "../config.js";
 import { retrieveEvidence, type Evidence } from "../retrieval/retriever.js";
+import {
+  runQueryIntelligence,
+  type QueryIntelligenceResult,
+} from "../query/index.js";
 
 export interface Citation {
   index: number;
@@ -15,6 +19,10 @@ export interface SearchResult {
   answer: string;
   citations: Citation[];
   evidenceCount: number;
+  /** Phase 5 Query Intelligence：分析 / 路由 / 实际检索文本（可观测性，§23） */
+  analysis?: QueryIntelligenceResult["analysis"];
+  plan?: QueryIntelligenceResult["plan"];
+  effectiveQueries?: string[];
 }
 
 /** Context Builder（§20）：把 Evidence 序列化为带引用编号的提示词上下文。 */
@@ -52,16 +60,29 @@ export async function generateAnswer(
 }
 
 /**
- * Query 链路（§17 Query Pipeline）：
+ * Query 链路（§13-15，Phase 5）：
+ * Analyze → Route → Transform（Rewrite / Multi Query / HyDE）→
  * Retrieve → Evidence → Context → Generate → Citation。
+ * opts.intelligence=false 可关闭 Query Intelligence，走直连混合检索。
  */
 export async function answerQuery(
   tenantId: string,
   query: string,
   topK?: number,
+  opts?: { intelligence?: boolean },
 ): Promise<SearchResult> {
   const k = topK ?? config.defaultTopK;
-  const evidence = await retrieveEvidence(tenantId, query, k);
+  const enabled = config.queryIntelligence.enabled && (opts?.intelligence ?? true);
+
+  let evidence: Evidence[];
+  let qi: QueryIntelligenceResult | undefined;
+  if (enabled) {
+    qi = await runQueryIntelligence(tenantId, query, k);
+    evidence = qi.evidence;
+  } else {
+    evidence = await retrieveEvidence(tenantId, query, k);
+  }
+
   const answer = await generateAnswer(query, evidence);
 
   const citations: Citation[] = evidence.map((e, i) => ({
@@ -77,5 +98,8 @@ export async function answerQuery(
     answer,
     citations,
     evidenceCount: evidence.length,
+    analysis: qi?.analysis,
+    plan: qi?.plan,
+    effectiveQueries: qi?.effectiveQueries,
   };
 }

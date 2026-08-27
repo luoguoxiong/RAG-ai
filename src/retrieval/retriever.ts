@@ -116,11 +116,18 @@ async function assembleEvidence(
 /**
  * Hybrid 检索（§10）：Vector + Keyword 并行检索 → RRF 融合 → 回表 Evidence →
  * Rerank 重排（§19）。关键词路故障时降级为纯向量。
+ * opts.useReranker=false 时跳过重排，按融合分排序返回（§23.1 降级路径，
+ * 由 RetrievalPlan.useReranker 驱动，§15）。
  */
+export interface RetrieveOptions {
+  useReranker?: boolean;
+}
+
 export async function retrieveEvidence(
   tenantId: string,
   query: string,
   topK: number,
+  opts: RetrieveOptions = {},
 ): Promise<Evidence[]> {
   const [vectorHits, keywordHits] = await Promise.all([
     new VectorRetriever().retrieve(tenantId, query, topK),
@@ -157,6 +164,10 @@ export async function retrieveEvidence(
     e.source = (sourceById.get(e.chunkId) ??
       "hybrid") as Evidence["source"];
     e.score = e.fusionScore ?? 0;
+  }
+
+  if (opts.useReranker === false) {
+    return evidence;
   }
 
   const reranked = await getReranker().rerank(

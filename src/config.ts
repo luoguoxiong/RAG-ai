@@ -31,6 +31,13 @@ export const config = {
   defaultTopK: Number(process.env.DEFAULT_TOP_K ?? 6),
   // 图遍历默认最大跳数
   defaultMaxHops: Number(process.env.DEFAULT_MAX_HOPS ?? 2),
+  // 每个 Retriever 独立超时（毫秒，RetrievalPlan.timeout，§23.1）
+  retrieverTimeoutMs: Number(process.env.RETRIEVER_TIMEOUT_MS ?? 3000),
+  // Query Intelligence（§13-15，Phase 5）
+  queryIntelligence: {
+    enabled: process.env.QUERY_INTELLIGENCE_ENABLED !== "false",
+    multiQueryCount: Number(process.env.MULTI_QUERY_COUNT ?? 3),
+  },
   // Evaluation（§22）：指标回退容忍度，低于基线×(1-tolerance) 视为回归（CI gate）
   evalBaselineTolerance: Number(process.env.EVAL_BASELINE_TOLERANCE ?? 0.1),
 };

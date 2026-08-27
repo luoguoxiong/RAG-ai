@@ -1,6 +1,7 @@
 import type { FastifyInstance } from "fastify";
 import { answerQuery } from "../application/query.js";
 import { retrieveGraph } from "../retrieval/graph.js";
+import { analyzeAndRoute } from "../query/index.js";
 
 function tenantOf(headers: Record<string, unknown>): string {
   const t = headers["x-tenant-id"];
@@ -14,6 +15,8 @@ interface SearchBody {
   query?: string;
   topK?: number;
   maxHops?: number;
+  /** 关闭 Query Intelligence（Phase 5），走直连混合检索 */
+  intelligence?: boolean;
 }
 
 export async function searchRoutes(app: FastifyInstance): Promise<void> {
@@ -27,7 +30,22 @@ export async function searchRoutes(app: FastifyInstance): Promise<void> {
       typeof req.body?.topK === "number" && req.body.topK > 0
         ? req.body.topK
         : undefined;
-    return answerQuery(tenantId, query, topK);
+    return answerQuery(tenantId, query, topK, {
+      intelligence: req.body?.intelligence,
+    });
+  });
+
+  // Query Intelligence 调试端点（§13-15）：只做分析 + 路由，不检索
+  app.post<{ Body: SearchBody }>("/search/analyze", async (req, reply) => {
+    const query = typeof req.body?.query === "string" ? req.body.query : "";
+    if (!query) {
+      return reply.code(400).send({ error: "query is required" });
+    }
+    const topK =
+      typeof req.body?.topK === "number" && req.body.topK > 0
+        ? req.body.topK
+        : undefined;
+    return analyzeAndRoute(query, topK);
   });
 
   // 图检索（§12 n-hop）：实体链接 + 子图遍历 + 子图证据回表
