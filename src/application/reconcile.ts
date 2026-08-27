@@ -137,6 +137,8 @@ async function repairIndexStatus(): Promise<number> {
 
   for (const tenantId of tenantIds) {
     await withTenantTx(tenantId, async (tx) => {
+      // §7.1 对账循环驱动信号：任何一路 != ready 都重新投递（含旧数据遗留的
+      // graph=pending，Neo4j 引入前索引的 chunk 在此补建图索引）
       const notReady = await tx
         .select({ chunkId: indexStatus.chunkId })
         .from(indexStatus)
@@ -145,6 +147,7 @@ async function repairIndexStatus(): Promise<number> {
             eq(indexStatus.vector, "failed"),
             eq(indexStatus.keyword, "failed"),
             eq(indexStatus.graph, "failed"),
+            eq(indexStatus.graph, "pending"),
           ),
         )
         .limit(200);
