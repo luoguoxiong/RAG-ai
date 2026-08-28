@@ -262,11 +262,36 @@ export interface ReconcileStats {
   communitiesRebuilt: number;
 }
 
-/** 一次完整对账循环（§7.1 Outbox + Reconciliation） */
+/**
+ * 一次完整对账循环（§7.1 Outbox + Reconciliation）。
+ *
+ * 作为系统的"兜底机制"周期性运行（Worker 进程 setInterval + 队列中的
+ * reconciliation Job），逐租户执行四个步骤，修复任何消费路径上的遗漏：
+ *
+ * 1. dispatchOutbox      把积压的 outbox 事件落成派生索引（向量/关键词/图），
+ *                        保证"先写库、后投递"链路中断后事件不会丢
+ * 2. repairIndexStatus   重投未就绪（failed/pending）的 chunk，清理孤儿记录，
+ *                        含旧数据补建图索引的场景
+ * 3. recoverStuckJobs    把卡在 processing 超时的 Job 重置为 pending 并重新入队，
+ *                        覆盖 Worker 崩溃导致的"僵尸 Job"
+ * 4. rebuildCommunitiesIfNeeded 实体/关系变化后按需重建社区（图图谱摘要）
+ *
+ * 每一步都按租户隔离遍历；任一步失败由调用方（setInterval / Worker）捕获记录，
+ * 不影响下一次对账继续执行。
+ */
 export async function runReconcile(): Promise<ReconcileStats> {
+  // 1. 派发 Outbox：幂等落派生索引（核心）
   const outboxDispatched = await dispatchOutbox();
+
+  // 2. 修复 index_status：重试失败索引 + 清理孤儿状态
   const indexRepaired = await repairIndexStatus();
+
+  // 3. 恢复卡死 Job：重置为 pending 并重新入队
   const jobsRecovered = await recoverStuckJobs();
+
+  // 4. 按需重建社区（图阶段功能）
   const communitiesRebuilt = await rebuildCommunitiesIfNeeded();
+
+  // 汇总统计，供调用方打日志/观测
   return { outboxDispatched, indexRepaired, jobsRecovered, communitiesRebuilt };
 }

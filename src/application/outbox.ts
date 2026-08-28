@@ -2,6 +2,7 @@ import { eq, sql } from "drizzle-orm";
 import { outbox } from "../db/schema/outbox.js";
 import type { Tx } from "../db/index.js";
 
+/** 事件类型：chunk 落库后通知派生索引（向量/关键词/图）写入或删除 */
 export type OutboxEventType = "chunk.upserted" | "chunk.removed";
 
 export interface OutboxEvent {
@@ -26,6 +27,7 @@ export async function emitOutbox(
   });
 }
 
+/** 便捷封装：chunk 已写入（含重建）时投递，Reconciliation 据此写派生索引 */
 export function emitChunkUpserted(tx: Tx, tenantId: string, chunkId: string) {
   return emitOutbox(tx, tenantId, {
     aggregateType: "chunk",
@@ -34,6 +36,7 @@ export function emitChunkUpserted(tx: Tx, tenantId: string, chunkId: string) {
   });
 }
 
+/** 便捷封装：chunk 已删除时投递，Reconciliation 据此清理派生索引 */
 export function emitChunkRemoved(tx: Tx, tenantId: string, chunkId: string) {
   return emitOutbox(tx, tenantId, {
     aggregateType: "chunk",
@@ -50,6 +53,7 @@ export async function markOutboxDone(tx: Tx, id: string): Promise<void> {
     .where(eq(outbox.id, id));
 }
 
+/** 标记失败并做指数退避重试：attempts+1，availableAt 延迟 2^attempts 秒再投递 */
 export async function markOutboxFailed(
   tx: Tx,
   id: string,
