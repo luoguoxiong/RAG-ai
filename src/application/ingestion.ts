@@ -1,6 +1,7 @@
 import { and, eq, inArray } from "drizzle-orm";
 import { db, withTenantTx, type Tx } from "../db/index.js";
 import { documents, documentVersions } from "../db/schema/document.js";
+import { datasetVersions } from "../db/schema/version.js";
 import { chunks, indexStatus } from "../db/schema/chunk.js";
 import { jobs } from "../db/schema/job.js";
 import { emitChunkUpserted, emitChunkRemoved } from "./outbox.js";
@@ -10,6 +11,8 @@ import { splitterFor } from "../ingestion/splitters.js";
 import { hashContent, hashChunk } from "../lib/hash.js";
 
 export interface IngestInput {
+  /** 文档独占归属的数据集版本（必须显式指定） */
+  versionId: string;
   fileName: string;
   mimeType: string;
   content: Buffer;
@@ -51,11 +54,22 @@ export async function ingestDocument(
   // 4. 事务内落库：Document、DocumentVersion、Job 任一失败则整体回滚，
   //    保证三者状态一致（不存在"有文档没 Job"的孤儿状态）
   return withTenantTx(tenantId, async (tx) => {
+    // 4.0 校验归属版本存在（版本不可删改，只允许归入已有版本）
+    const [datasetVersion] = await tx
+      .select({ id: datasetVersions.id })
+      .from(datasetVersions)
+      .where(
+        and(eq(datasetVersions.id, input.versionId), eq(datasetVersions.tenantId, tenantId)),
+      )
+      .limit(1);
+    if (!datasetVersion) throw new Error(`dataset version not found: ${input.versionId}`);
+
     // 4.1 建 Document（sourceType=file，sourceUri=原始文件名），初始 pending
     const [doc] = await tx
       .insert(documents)
       .values({
         tenantId,
+        versionId: input.versionId,
         sourceType: "file",
         sourceUri: input.fileName,
         title: parsed.title,

@@ -29,10 +29,11 @@ async function retrieveEvidenceMulti(
   queries: string[],
   topK: number,
   useReranker: boolean,
+  documentIds?: string[],
 ): Promise<Evidence[]> {
   const results = await Promise.all(
     queries.map((q) =>
-      retrieveEvidence(tenantId, q, topK, { useReranker }),
+      retrieveEvidence(tenantId, q, topK, { useReranker, documentIds }),
     ),
   );
   const rankLists = results.map((evs) =>
@@ -67,6 +68,7 @@ export async function runQueryIntelligence(
   tenantId: string,
   query: string,
   topK?: number,
+  documentIds?: string[],
 ): Promise<QueryIntelligenceResult> {
   const k = topK ?? config.defaultTopK;
   const analysis = await analyzeQuery(query);
@@ -77,6 +79,7 @@ export async function runQueryIntelligence(
     analysis,
     plan,
     k,
+    documentIds,
   );
   return { analysis, plan, effectiveQueries, evidence };
 }
@@ -88,6 +91,7 @@ export async function transformAndRetrieve(
   analysis: QueryAnalysis,
   plan: RetrievalPlan,
   topK: number,
+  documentIds?: string[],
 ): Promise<{ effectiveQueries: string[]; evidence: Evidence[] }> {
   const useReranker = plan.useReranker;
 
@@ -97,7 +101,10 @@ export async function transformAndRetrieve(
     const q = rewritten.trim() || query;
     return {
       effectiveQueries: [q],
-      evidence: await retrieveEvidence(tenantId, q, topK, { useReranker }),
+      evidence: await retrieveEvidence(tenantId, q, topK, {
+        useReranker,
+        documentIds,
+      }),
     };
   }
 
@@ -110,7 +117,13 @@ export async function transformAndRetrieve(
     const effective = queries.length > 1 ? queries : [query];
     return {
       effectiveQueries: effective,
-      evidence: await retrieveEvidenceMulti(tenantId, effective, topK, useReranker),
+      evidence: await retrieveEvidenceMulti(
+        tenantId,
+        effective,
+        topK,
+        useReranker,
+        documentIds,
+      ),
     };
   }
 
@@ -120,7 +133,10 @@ export async function transformAndRetrieve(
     if (hypo) {
       return {
         effectiveQueries: [hypo],
-        evidence: await retrieveEvidence(tenantId, hypo, topK, { useReranker }),
+        evidence: await retrieveEvidence(tenantId, hypo, topK, {
+          useReranker,
+          documentIds,
+        }),
       };
     }
   }
@@ -128,7 +144,10 @@ export async function transformAndRetrieve(
   // Simple → Direct
   return {
     effectiveQueries: [query],
-    evidence: await retrieveEvidence(tenantId, query, topK, { useReranker }),
+    evidence: await retrieveEvidence(tenantId, query, topK, {
+      useReranker,
+      documentIds,
+    }),
   };
 }
 

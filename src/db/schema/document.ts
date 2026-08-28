@@ -7,12 +7,17 @@ import {
   timestamp,
 } from "drizzle-orm/pg-core";
 import { tenants } from "./tenant";
+import { datasetVersions } from "./version";
 
 export const documents = pgTable("documents", {
   id: uuid("id").primaryKey().defaultRandom(),
   tenantId: uuid("tenant_id")
     .notNull()
     .references(() => tenants.id, { onDelete: "cascade" }),
+  /** 独占归属的数据集版本；版本不可删改，文档随版本存活 */
+  versionId: uuid("version_id")
+    .notNull()
+    .references(() => datasetVersions.id, { onDelete: "restrict" }),
   sourceType: text("source_type").notNull(),
   sourceUri: text("source_uri").notNull(),
   title: text("title"),

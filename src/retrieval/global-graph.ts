@@ -1,6 +1,6 @@
-import { eq, inArray } from "drizzle-orm";
+import { and, eq, inArray } from "drizzle-orm";
 import { withTenantTx } from "../db/index.js";
-import { communities, communityMembers, entities } from "../db/schema/entity.js";
+import { communities, communityMembers, entities, entityMentions } from "../db/schema/entity.js";
 import { config } from "../config.js";
 
 /**
@@ -52,6 +52,7 @@ export async function globalGraphSearch(
   tenantId: string,
   query: string,
   topK?: number,
+  documentIds?: string[],
 ): Promise<GlobalGraphResult> {
   const k = topK ?? config.defaultTopK;
 
@@ -78,7 +79,37 @@ export async function globalGraphSearch(
         entityIds: members.map((m) => m.entityId),
       });
     }
-    return result;
+
+    // 版本过滤：社区按租户构建、实体跨文档共享，只有"成员实体在该版本文档集内有
+    // mentions"的社区才算该版本的社区。先收集全部成员实体，一次查询有效提及集合
+    const allEntityIds = [...new Set(result.flatMap((c) => c.entityIds))];
+    let scopedEntityIds = new Set<string>();
+    if (allEntityIds.length > 0) {
+      const mentions =
+        documentIds && documentIds.length > 0
+          ? await tx
+              .select({ entityId: entityMentions.entityId })
+              .from(entityMentions)
+              .where(
+                and(
+                  inArray(entityMentions.entityId, allEntityIds),
+                  inArray(entityMentions.documentId, documentIds),
+                ),
+              )
+          : await tx
+              .select({ entityId: entityMentions.entityId })
+              .from(entityMentions)
+              .where(inArray(entityMentions.entityId, allEntityIds));
+      scopedEntityIds = new Set(mentions.map((m) => m.entityId));
+    }
+
+    return result
+      .map((c) => ({
+        ...c,
+        // 只保留版本内实际被提及的成员实体
+        entityIds: c.entityIds.filter((id) => scopedEntityIds.has(id)),
+      }))
+      .filter((c) => c.entityIds.length > 0);
   });
 
   // Score and rank

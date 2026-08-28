@@ -1,4 +1,5 @@
 export * from "./tenant";
+export * from "./version";
 export * from "./document";
 export * from "./chunk";
 export * from "./entity";

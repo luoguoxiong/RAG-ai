@@ -4,6 +4,7 @@ import { db, withTenantTx } from "../db/index.js";
 import { documents } from "../db/schema/document.js";
 import { jobs } from "../db/schema/job.js";
 import { ingestDocument } from "../application/ingestion.js";
+import { resolveVersionDocumentIds } from "../application/version.js";
 import { createJob } from "../application/job.js";
 import { enqueueJob } from "../queue/index.js";
 
@@ -46,18 +47,37 @@ export async function documentRoutes(app: FastifyInstance): Promise<void> {
       return reply.code(400).send({ error: "file field is required" });
     }
 
-    // 3. 将上传流完整读入内存（大文件场景可优化为流式落盘，这里保持简单）
+    // 3. 读取归属版本（multipart 字段 versionId），必填：
+    //    文档独占归属某个数据集版本，且版本不可删改
+    const raw = data.fields.versionId as
+      | { value?: unknown }
+      | Array<{ value?: unknown }>
+      | undefined;
+    const rawValue = Array.isArray(raw) ? raw[0]?.value : raw?.value;
+    const versionId =
+      typeof rawValue === "string" && rawValue.length > 0 ? rawValue : undefined;
+    if (!versionId) {
+      return reply.code(400).send({ error: "versionId field is required" });
+    }
+    try {
+      await resolveVersionDocumentIds(tenantId, versionId);
+    } catch {
+      return reply.code(400).send({ error: `dataset version not found: ${versionId}` });
+    }
+
+    // 4. 将上传流完整读入内存（大文件场景可优化为流式落盘，这里保持简单）
     const content = await data.toBuffer();
 
-    // 4. 调用应用层入口：解析文件内容 → 归一化 → 事务内写入
+    // 5. 调用应用层入口：解析文件内容 → 归一化 → 事务内写入
     //    documents / document_versions / jobs 三张表，返回三者的 id
     const result = await ingestDocument(tenantId, {
+      versionId,
       fileName: data.filename,
       mimeType: data.mimetype,
       content,
     });
 
-    // 5. 把"索引该版本"的任务投递到 Redis 队列（index_document），
+    // 6. 把"索引该版本"的任务投递到 Redis 队列（index_document），
     //    Worker 收到后会创建 DocumentVersion + chunks 并触发派生索引。
     await enqueueJob("index_document", result.jobId, {
       tenantId,
@@ -65,7 +85,7 @@ export async function documentRoutes(app: FastifyInstance): Promise<void> {
       versionId: result.versionId,
     });
 
-    // 6. 202 Accepted：任务已受理，真正的索引进度通过 GET /documents/:id 查询
+    // 7. 202 Accepted：任务已受理，真正的索引进度通过 GET /documents/:id 查询
     return reply.code(202).send(result);
   });
 

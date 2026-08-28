@@ -53,12 +53,26 @@ export class VectorStore {
     await this.client.delete(collectionName(tenantId), { wait: true, points: ids });
   }
 
-  async search(tenantId: string, vector: number[], topK: number): Promise<VectorHit[]> {
+  async search(
+    tenantId: string,
+    vector: number[],
+    topK: number,
+    opts?: { documentIds?: string[] },
+  ): Promise<VectorHit[]> {
     await this.ensureCollection(tenantId);
+    const filter =
+      opts?.documentIds && opts.documentIds.length > 0
+        ? {
+            must: [
+              { key: "documentId", match: { any: opts.documentIds } as never },
+            ],
+          }
+        : undefined;
     const res = await this.client.query(collectionName(tenantId), {
       query: vector,
       limit: topK,
       with_payload: true,
+      filter,
     });
     return res.points.map((p) => ({
       id: String(p.id),

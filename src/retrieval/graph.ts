@@ -1,4 +1,4 @@
-import { inArray } from "drizzle-orm";
+import { and, eq, inArray } from "drizzle-orm";
 import { config } from "../config.js";
 import { withTenantTx } from "../db/index.js";
 import { chunks } from "../db/schema/chunk.js";
@@ -42,6 +42,7 @@ export async function retrieveGraph(
   tenantId: string,
   query: string,
   maxHops: number = config.defaultMaxHops,
+  documentIds?: string[],
 ): Promise<GraphRetrievalResult> {
   // 查询侧实体抽取：确定性启发式（快、无外部 LLM 依赖），与索引侧规则对齐
   const extracted = await new DeterministicEntityExtractor().extract(query);
@@ -49,19 +50,40 @@ export async function retrieveGraph(
     ...new Set(extracted.entities.map((e) => normalizeEntityName(e.name)).filter(Boolean)),
   ];
 
-  // 1) Entity Linking：在 PG entities 中按规范化名命中，得到 seed 节点
+  // 1) Entity Linking：在 PG entities 中按规范化名命中，得到 seed 节点。
+  //    版本过滤：仅当实体在该版本文档集合内有 mentions 时才作为 seed，
+  //    避免跨版本共享实体把子图串出版本边界
   const seeds = await withTenantTx(tenantId, async (tx): Promise<LinkedEntity[]> => {
     if (normNames.length === 0) return [];
     const rows = await tx
-      .select()
+      .select({
+        entityId: entities.id,
+        canonicalName: entities.canonicalName,
+        type: entities.type,
+      })
       .from(entities)
-      .where(inArray(entities.normalizedName, normNames))
+      .innerJoin(entityMentions, eq(entityMentions.entityId, entities.id))
+      .where(
+        and(
+          inArray(entities.normalizedName, normNames),
+          ...(documentIds && documentIds.length > 0
+            ? [inArray(entityMentions.documentId, documentIds)]
+            : []),
+        ),
+      )
       .limit(50);
-    return rows.map((e) => ({
-      entityId: e.id,
-      canonicalName: e.canonicalName,
-      type: e.type,
-    }));
+    const seen = new Set<string>();
+    const linked: LinkedEntity[] = [];
+    for (const r of rows) {
+      if (seen.has(r.entityId)) continue;
+      seen.add(r.entityId);
+      linked.push({
+        entityId: r.entityId,
+        canonicalName: r.canonicalName,
+        type: r.type,
+      });
+    }
+    return linked;
   });
 
   // 2) n-hop 遍历：以 seed 为起点，最多 maxHops 跳（Neo4j 派生索引）
@@ -71,6 +93,7 @@ export async function retrieveGraph(
       tenantId,
       seeds.map((s) => s.entityId),
       maxHops,
+      documentIds,
     );
   } catch (err) {
     console.warn(
@@ -113,7 +136,14 @@ export async function retrieveGraph(
     const rows = await tx
       .select()
       .from(chunks)
-      .where(inArray(chunks.id, chunkIds));
+      .where(
+        and(
+          inArray(chunks.id, chunkIds),
+          ...(documentIds && documentIds.length > 0
+            ? [inArray(chunks.documentId, documentIds)]
+            : []),
+        ),
+      );
     return rows
       .filter((c) => c.type === "child")
       .map((c) => ({

@@ -8,9 +8,15 @@ import { getReranker } from "../ranking/reranker.js";
 
 /**
  * Retriever 抽象（§16）：Query Pipeline 只依赖接口，不绑定具体索引实现。
+ * documentIds 用于版本过滤：限定只在这些文档的 chunk 内检索。
  */
 export interface Retriever {
-  retrieve(tenantId: string, query: string, topK: number): Promise<RetrievalHit[]>;
+  retrieve(
+    tenantId: string,
+    query: string,
+    topK: number,
+    documentIds?: string[],
+  ): Promise<RetrievalHit[]>;
 }
 
 /** 归一化命中的证据：id 即 chunkId，统一检索来源的相对排序 */
@@ -21,10 +27,17 @@ export interface RetrievalHit {
 }
 
 export class VectorRetriever implements Retriever {
-  async retrieve(tenantId: string, query: string, topK: number): Promise<RetrievalHit[]> {
+  async retrieve(
+    tenantId: string,
+    query: string,
+    topK: number,
+    documentIds?: string[],
+  ): Promise<RetrievalHit[]> {
     const [vector] = await getEmbedding().embed([query]);
     if (!vector) return [];
-    const hits = await getVectorStore().search(tenantId, vector, topK);
+    const hits = await getVectorStore().search(tenantId, vector, topK, {
+      documentIds,
+    });
     return hits.map((h) => ({
       id: String(h.payload.chunkId ?? h.id),
       score: h.score,
@@ -34,10 +47,17 @@ export class VectorRetriever implements Retriever {
 }
 
 export class KeywordRetriever implements Retriever {
-  async retrieve(tenantId: string, query: string, topK: number): Promise<RetrievalHit[]> {
+  async retrieve(
+    tenantId: string,
+    query: string,
+    topK: number,
+    documentIds?: string[],
+  ): Promise<RetrievalHit[]> {
     let hits: KeywordHit[];
     try {
-      hits = await getKeywordStore().search(tenantId, query, topK);
+      hits = await getKeywordStore().search(tenantId, query, topK, {
+        documentIds,
+      });
     } catch {
       // 降级：关键词索引不可用时返回空，仅靠向量路（§23.1）
       hits = [];
@@ -71,6 +91,7 @@ export interface Evidence {
 async function assembleEvidence(
   tenantId: string,
   childIds: string[],
+  documentIds?: string[],
 ): Promise<Evidence[]> {
   return withTenantTx(tenantId, async (tx) => {
     const childRows = await tx
@@ -95,6 +116,8 @@ async function assembleEvidence(
       .map((id, i): Evidence | null => {
         const child = childById.get(id);
         if (!child) return null;
+        // 版本过滤兜底：即使索引侧漏过滤，回表后也丢弃非版本文档的 chunk
+        if (documentIds && !documentIds.includes(child.documentId)) return null;
         const parent = child.parentId ? parentById.get(child.parentId) : undefined;
         const title =
           typeof child.metadata.title === "string" ? child.metadata.title : "";
@@ -121,6 +144,8 @@ async function assembleEvidence(
  */
 export interface RetrieveOptions {
   useReranker?: boolean;
+  /** 版本过滤：限定只在这些文档的 chunk 内检索 */
+  documentIds?: string[];
 }
 
 export async function retrieveEvidence(
@@ -129,9 +154,10 @@ export async function retrieveEvidence(
   topK: number,
   opts: RetrieveOptions = {},
 ): Promise<Evidence[]> {
+  const { documentIds } = opts;
   const [vectorHits, keywordHits] = await Promise.all([
-    new VectorRetriever().retrieve(tenantId, query, topK),
-    new KeywordRetriever().retrieve(tenantId, query, topK),
+    new VectorRetriever().retrieve(tenantId, query, topK, documentIds),
+    new KeywordRetriever().retrieve(tenantId, query, topK, documentIds),
   ]);
 
   const vectorScore = new Map(vectorHits.map((h) => [h.id, h.score]));
@@ -155,6 +181,7 @@ export async function retrieveEvidence(
   const evidence = await assembleEvidence(
     tenantId,
     fused.map((f) => f.id),
+    documentIds,
   );
 
   for (const e of evidence) {

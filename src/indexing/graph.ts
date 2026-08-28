@@ -209,19 +209,27 @@ export class GraphStore {
     tenantId: string,
     seedIds: string[],
     maxHops: number,
+    documentIds?: string[],
   ): Promise<GraphPath[]> {
     if (seedIds.length === 0) return [];
     const hops = Math.max(1, Math.min(Math.floor(maxHops), 5));
     const s = this.session();
     try {
+      // 版本过滤：路径上每条 REL 关系都必须来自版本文档集内的文档，
+      // 避免实体跨文档共享导致子图串出版本边界
+      const versionFilter =
+        documentIds && documentIds.length > 0
+          ? "AND all(r IN rels WHERE r.sourceDocumentId IN $docIds)"
+          : "";
       const res = await s.run(
         `MATCH (seed:Entity {tenantId: $tenantId})
          WHERE seed.entityId IN $ids
          MATCH path = (seed)-[rels:REL *1..${hops}]-(other:Entity {tenantId: $tenantId})
          WHERE all(n IN nodes(path) WHERE n.tenantId = $tenantId)
+         ${versionFilter}
          RETURN path
          LIMIT 50`,
-        { tenantId, ids: seedIds },
+        { tenantId, ids: seedIds, docIds: documentIds ?? [] },
       );
       const paths: GraphPath[] = [];
       for (const r of res.records) {

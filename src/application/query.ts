@@ -69,18 +69,19 @@ export async function answerQuery(
   tenantId: string,
   query: string,
   topK?: number,
-  opts?: { intelligence?: boolean },
+  opts?: { intelligence?: boolean; documentIds?: string[] },
 ): Promise<SearchResult> {
   const k = topK ?? config.defaultTopK;
   const enabled = config.queryIntelligence.enabled && (opts?.intelligence ?? true);
+  const documentIds = opts?.documentIds;
 
   let evidence: Evidence[];
   let qi: QueryIntelligenceResult | undefined;
   if (enabled) {
-    qi = await runQueryIntelligence(tenantId, query, k);
+    qi = await runQueryIntelligence(tenantId, query, k, documentIds);
     evidence = qi.evidence;
   } else {
-    evidence = await retrieveEvidence(tenantId, query, k);
+    evidence = await retrieveEvidence(tenantId, query, k, { documentIds });
   }
 
   const answer = await generateAnswer(query, evidence);

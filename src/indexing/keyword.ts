@@ -73,14 +73,24 @@ export class KeywordStore {
     tenantId: string,
     query: string,
     topK: number,
+    opts?: { documentIds?: string[] },
   ): Promise<KeywordHit[]> {
     await this.ensureIndex(tenantId);
+    const body =
+      opts?.documentIds && opts.documentIds.length > 0
+        ? {
+            size: topK,
+            query: {
+              bool: {
+                must: [{ match: { content: query } }],
+                filter: [{ terms: { documentId: opts.documentIds } }],
+              },
+            },
+          }
+        : { size: topK, query: { match: { content: query } } };
     const res = await this.client.search({
       index: indexName(tenantId),
-      body: {
-        size: topK,
-        query: { match: { content: query } },
-      },
+      body,
     });
     const hits = res.body.hits.hits as Array<{
       _id?: string;
