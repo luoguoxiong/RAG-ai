@@ -233,6 +233,23 @@ export class GraphStore {
       await s.close();
     }
   }
+
+  /**
+   * 执行只读 Cypher 查询（§17 Text2Cypher）。
+   * 调用方负责校验 Cypher 只含只读子句，此方法注入 tenantId 参数后执行。
+   */
+  async runReadOnlyQuery(
+    cypher: string,
+    params: Record<string, unknown>,
+  ): Promise<Record<string, unknown>[]> {
+    const s = this.session();
+    try {
+      const res = await s.run(cypher, { ...params });
+      return res.records.map((r) => r.toObject());
+    } finally {
+      await s.close();
+    }
+  }
 }
 
 let _store: GraphStore | undefined;

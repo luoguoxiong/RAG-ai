@@ -1,6 +1,7 @@
 import {
   doublePrecision,
   index,
+  integer,
   jsonb,
   pgTable,
   text,
@@ -130,3 +131,60 @@ export type EntityMentionRow = typeof entityMentions.$inferSelect;
 export type NewEntityMentionRow = typeof entityMentions.$inferInsert;
 export type RelationRow = typeof relations.$inferSelect;
 export type NewRelationRow = typeof relations.$inferInsert;
+
+/**
+ * 社区（Phase 7 Advanced GraphRAG）：连通分量检测后的实体聚类。
+ * 每个社区有 LLM 生成的摘要，供 Global Graph Search 使用。
+ */
+export const communities = pgTable(
+  "communities",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    tenantId: uuid("tenant_id")
+      .notNull()
+      .references(() => tenants.id, { onDelete: "cascade" }),
+    communityIndex: integer("community_index").notNull(),
+    summary: text("summary"),
+    entityCount: integer("entity_count").notNull().default(0),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (t) => ({
+    tenantIdx: index("communities_tenant_idx").on(t.tenantId),
+  }),
+);
+
+export const communityMembers = pgTable(
+  "community_members",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    tenantId: uuid("tenant_id")
+      .notNull()
+      .references(() => tenants.id, { onDelete: "cascade" }),
+    communityId: uuid("community_id")
+      .notNull()
+      .references(() => communities.id, { onDelete: "cascade" }),
+    entityId: uuid("entity_id")
+      .notNull()
+      .references(() => entities.id, { onDelete: "cascade" }),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (t) => ({
+    uniqCommunityEntity: uniqueIndex("community_members_comm_entity_idx").on(
+      t.communityId,
+      t.entityId,
+    ),
+    entityIdx: index("community_members_entity_idx").on(t.entityId),
+  }),
+);
+
+export type CommunityRow = typeof communities.$inferSelect;
+export type NewCommunityRow = typeof communities.$inferInsert;
+export type CommunityMemberRow = typeof communityMembers.$inferSelect;
+export type NewCommunityMemberRow = typeof communityMembers.$inferInsert;

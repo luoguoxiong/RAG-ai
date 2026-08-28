@@ -2,11 +2,13 @@ import { and, eq, lt, or, sql } from "drizzle-orm";
 import { db, withTenantTx, type Tx } from "../db/index.js";
 import { tenants } from "../db/schema/tenant.js";
 import { chunks, indexStatus } from "../db/schema/chunk.js";
+import { entities, communityMembers } from "../db/schema/entity.js";
 import { jobs } from "../db/schema/job.js";
 import { outbox } from "../db/schema/outbox.js";
 import { markOutboxFailed } from "./outbox.js";
 import { createHybridIndexWriter, type IndexWriter } from "../indexing/writer.js";
 import { createGraphIndexWriter } from "../indexing/graph.js";
+import { rebuildCommunities } from "../indexing/community.js";
 import { enqueueJob } from "../queue/index.js";
 import type { JobType } from "../domain/index.js";
 
@@ -214,10 +216,50 @@ async function recoverStuckJobs(): Promise<number> {
   return recovered;
 }
 
+/** 检查社区是否需要重建：entity 数量与 community_member 数量不一致 */
+async function checkCommunityRebuild(
+  tx: Tx,
+): Promise<boolean> {
+  const entityRows = await tx.select({ id: entities.id }).from(entities);
+  const memberRows = await tx
+    .select({ id: communityMembers.id })
+    .from(communityMembers);
+  return entityRows.length !== memberRows.length;
+}
+
+/** 社区重建（Phase 7）：实体/关系变化后重新检测连通分量 + 生成摘要 */
+async function rebuildCommunitiesIfNeeded(): Promise<number> {
+  const tenantIds = (await db.select({ id: tenants.id }).from(tenants)).map(
+    (t) => t.id,
+  );
+  let rebuilt = 0;
+  for (const tenantId of tenantIds) {
+    const needRebuild = await withTenantTx(tenantId, (tx) =>
+      checkCommunityRebuild(tx),
+    );
+    if (!needRebuild) continue;
+    try {
+      const stats = await rebuildCommunities(tenantId);
+      console.log(
+        `[reconcile] communities rebuilt for tenant ${tenantId}: ${stats.communities} communities, ${stats.entities} entities`,
+      );
+      rebuilt += stats.communities;
+    } catch (err) {
+      console.warn(
+        `[reconcile] community rebuild failed for tenant ${tenantId}: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+  }
+  return rebuilt;
+}
+
 export interface ReconcileStats {
   outboxDispatched: number;
   indexRepaired: number;
   jobsRecovered: number;
+  communitiesRebuilt: number;
 }
 
 /** 一次完整对账循环（§7.1 Outbox + Reconciliation） */
@@ -225,5 +267,6 @@ export async function runReconcile(): Promise<ReconcileStats> {
   const outboxDispatched = await dispatchOutbox();
   const indexRepaired = await repairIndexStatus();
   const jobsRecovered = await recoverStuckJobs();
-  return { outboxDispatched, indexRepaired, jobsRecovered };
+  const communitiesRebuilt = await rebuildCommunitiesIfNeeded();
+  return { outboxDispatched, indexRepaired, jobsRecovered, communitiesRebuilt };
 }

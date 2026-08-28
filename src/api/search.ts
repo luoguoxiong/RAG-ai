@@ -1,6 +1,8 @@
 import type { FastifyInstance } from "fastify";
 import { answerQuery } from "../application/query.js";
 import { retrieveGraph } from "../retrieval/graph.js";
+import { text2Cypher } from "../retrieval/text2cypher.js";
+import { globalGraphSearch } from "../retrieval/global-graph.js";
 import { analyzeAndRoute } from "../query/index.js";
 
 function tenantOf(headers: Record<string, unknown>): string {
@@ -62,5 +64,29 @@ export async function searchRoutes(app: FastifyInstance): Promise<void> {
         ? req.body.maxHops
         : undefined;
     return retrieveGraph(tenantId, query, maxHops);
+  });
+
+  // Text2Cypher（§17）：自然语言 -> Cypher -> 校验 -> Neo4j 只读查询
+  app.post<{ Body: SearchBody }>("/search/cypher", async (req, reply) => {
+    const tenantId = tenantOf(req.headers);
+    const query = typeof req.body?.query === "string" ? req.body.query : "";
+    if (!query) {
+      return reply.code(400).send({ error: "query is required" });
+    }
+    return text2Cypher(tenantId, query);
+  });
+
+  // Global Graph Search（Phase 7）：社区摘要检索
+  app.post<{ Body: SearchBody }>("/search/global", async (req, reply) => {
+    const tenantId = tenantOf(req.headers);
+    const query = typeof req.body?.query === "string" ? req.body.query : "";
+    if (!query) {
+      return reply.code(400).send({ error: "query is required" });
+    }
+    const topK =
+      typeof req.body?.topK === "number" && req.body.topK > 0
+        ? req.body.topK
+        : undefined;
+    return globalGraphSearch(tenantId, query, topK);
   });
 }
