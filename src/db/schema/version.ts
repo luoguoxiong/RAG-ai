@@ -22,14 +22,19 @@ import { tenants } from "./tenant";
 export const datasetVersions = pgTable(
   "dataset_versions",
   {
+    /** 主键：数据集版本 id */
     id: uuid("id").primaryKey().defaultRandom(),
+    /** 租户隔离 */
     tenantId: uuid("tenant_id")
       .notNull()
       .references(() => tenants.id, { onDelete: "cascade" }),
+    /** 版本名称，如 v1 / 生产快照（展示用） */
     name: text("name").notNull(),
     /** 租户内递增的版本号（创建时取 max+1），作为"只能递增"的载体 */
     version: integer("version").notNull(),
+    /** 状态：active（当前生效版本）/ inactive；每租户最多一个 active */
     status: text("status").notNull().default("active"),
+    /** 创建时间 */
     createdAt: timestamp("created_at", { withTimezone: true })
       .notNull()
       .defaultNow(),

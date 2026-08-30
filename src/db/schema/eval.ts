@@ -36,14 +36,21 @@ export interface EvalMetrics {
  * 索引 / embedding 升级后必须重建基线，避免与旧 ground truth 错配。
  */
 export const evalDatasets = pgTable("eval_datasets", {
+  /** 主键：评估集 id */
   id: uuid("id").primaryKey().defaultRandom(),
+  /** 租户隔离 */
   tenantId: uuid("tenant_id")
     .notNull()
     .references(() => tenants.id, { onDelete: "cascade" }),
+  /** 评估集名称（展示用） */
   name: text("name").notNull(),
+  /** 评估集描述 */
   description: text("description"),
+  /** 绑定的索引版本（索引升级后需重建基线） */
   indexVersion: text("index_version").notNull().default("1"),
+  /** 绑定的 embedding 版本（模型升级后需重建基线） */
   embeddingVersion: text("embedding_version").notNull().default("1"),
+  /** 创建时间 */
   createdAt: timestamp("created_at", { withTimezone: true })
     .notNull()
     .defaultNow(),
@@ -52,19 +59,24 @@ export const evalDatasets = pgTable("eval_datasets", {
 export const evalQueries = pgTable(
   "eval_queries",
   {
+    /** 主键：评估查询 id */
     id: uuid("id").primaryKey().defaultRandom(),
+    /** 租户隔离 */
     tenantId: uuid("tenant_id")
       .notNull()
       .references(() => tenants.id, { onDelete: "cascade" }),
+    /** 所属评估集（评估集删除时级联删查询） */
     datasetId: uuid("dataset_id")
       .notNull()
       .references(() => evalDatasets.id, { onDelete: "cascade" }),
+    /** 评估问题文本 */
     query: text("query").notNull(),
     // 检索 ground truth：黄金 chunk id 集合（retrieval ground truth）
     goldChunkIds: jsonb("gold_chunk_ids").$type<string[]>().notNull().default([]),
     // 生成 ground truth：参考答案与关键事实（generation ground truth）
     referenceAnswer: text("reference_answer"),
     keyFacts: jsonb("key_facts").$type<string[]>().notNull().default([]),
+    /** 创建时间 */
     createdAt: timestamp("created_at", { withTimezone: true })
       .notNull()
       .defaultNow(),
@@ -78,28 +90,43 @@ export const evalQueries = pgTable(
 );
 
 export const evalRuns = pgTable("eval_runs", {
+  /** 主键：评估运行 id */
   id: uuid("id").primaryKey().defaultRandom(),
+  /** 租户隔离 */
   tenantId: uuid("tenant_id")
     .notNull()
     .references(() => tenants.id, { onDelete: "cascade" }),
+  /** 运行的评估集（评估集删除时级联删运行） */
   datasetId: uuid("dataset_id")
     .notNull()
     .references(() => evalDatasets.id, { onDelete: "cascade" }),
+  /** 本次运行的索引版本 */
   indexVersion: text("index_version").notNull(),
+  /** 本次运行的 embedding 版本 */
   embeddingVersion: text("embedding_version").notNull(),
+  /** 本次运行的 embedding 模型名 */
   embeddingModel: text("embedding_model"),
+  /** 检索 Top-K（默认 6） */
   topK: integer("top_k").notNull().default(6),
+  /** 本次运行的生成 LLM 模型名 */
   llmModel: text("llm_model"),
+  /** 本次运行的 Reranker 模型名 */
   reranker: text("reranker"),
+  /** 状态：running → completed / failed */
   status: text("status").notNull().default("running"),
+  /** 失败时的错误信息 */
   error: text("error"),
   // 汇总指标（所有查询的均值）
   metrics: jsonb("metrics").$type<Partial<EvalMetrics>>().notNull().default({}),
+  /** 评估报告（markdown 文本） */
   report: text("report"),
   // 回归门禁（§22.1 CI gate）：与基线对比后得出
   baselineRunId: uuid("baseline_run_id"),
+  /** 对比基线发生回归的指标名集合（如 ["recallAtK"]） */
   regressedMetrics: jsonb("regressed_metrics").$type<string[]>().notNull().default([]),
+  /** 回归门禁是否通过：未配置基线为 null，对比后 true/false */
   gatePassed: boolean("gate_passed"),
+  /** 创建时间 */
   createdAt: timestamp("created_at", { withTimezone: true })
     .notNull()
     .defaultNow(),
@@ -108,24 +135,34 @@ export const evalRuns = pgTable("eval_runs", {
 export const evalRunResults = pgTable(
   "eval_run_results",
   {
+    /** 主键：单条查询评估结果 id */
     id: uuid("id").primaryKey().defaultRandom(),
+    /** 租户隔离 */
     tenantId: uuid("tenant_id")
       .notNull()
       .references(() => tenants.id, { onDelete: "cascade" }),
+    /** 所属运行（运行删除时级联删结果） */
     runId: uuid("run_id")
       .notNull()
       .references(() => evalRuns.id, { onDelete: "cascade" }),
+    /** 对应评估查询（查询删除时级联删结果） */
     queryId: uuid("query_id")
       .notNull()
       .references(() => evalQueries.id, { onDelete: "cascade" }),
+    /** 查询文本（快照，查询可后续修改不影响历史） */
     query: text("query").notNull(),
+    /** 黄金 chunk id 集合（快照） */
     goldChunkIds: jsonb("gold_chunk_ids").$type<string[]>().notNull().default([]),
+    /** 本次实际召回结果（快照，供回溯分析） */
     retrievedChunkIds: jsonb("retrieved_chunk_ids")
       .$type<string[]>()
       .notNull()
       .default([]),
+    /** 单条查询的 8 项评估指标 */
     metrics: jsonb("metrics").$type<Partial<EvalMetrics>>().notNull().default({}),
+    /** 本次生成的答案文本 */
     answer: text("answer"),
+    /** 创建时间 */
     createdAt: timestamp("created_at", { withTimezone: true })
       .notNull()
       .defaultNow(),

@@ -1,7 +1,7 @@
 import { and, eq, lt, or, sql } from "drizzle-orm";
 import { db, withTenantTx, type Tx } from "../db/index.js";
 import { tenants } from "../db/schema/tenant.js";
-import { chunks, indexStatus } from "../db/schema/chunk.js";
+import { chunks, indexStatus, type ChunkRow } from "../db/schema/chunk.js";
 import { entities, communityMembers } from "../db/schema/entity.js";
 import { jobs } from "../db/schema/job.js";
 import { outbox } from "../db/schema/outbox.js";
@@ -15,35 +15,58 @@ import type { JobType } from "../domain/index.js";
 const writer: IndexWriter = createHybridIndexWriter();
 const graphWriter: IndexWriter = createGraphIndexWriter();
 
-/** chunk.upserted：写入向量 + 关键词（仅 child 落索引，§6）+ 图索引（独立容错） */
-async function applyChunkUpserted(
-  tx: Tx,
+/**
+ * 外部派生索引写入（向量 + 关键词 + 图）。
+ *
+ * 关键约束：本函数只做外部 I/O（embedding / Qdrant / OpenSearch / Neo4j / LLM），
+ * 绝不打开 DB 事务、不占用连接池连接——外部调用可能很慢甚至挂起，
+ * 若在事务内执行会把连接和行锁拖死（曾导致连接池耗尽 + index_status 互相等锁）。
+ * 返回 graph 索引状态，由调用方在独立的短事务里落 index_status。
+ */
+async function writeDerivedIndexes(
   tenantId: string,
-  chunkId: string,
-): Promise<void> {
-  const [chunk] = await tx
-    .select()
-    .from(chunks)
-    .where(eq(chunks.id, chunkId))
-    .limit(1);
-  if (!chunk) return; // chunk 已被删除（事件与删除竞争）
-
+  chunk: ChunkRow,
+): Promise<"ready" | "failed" | "pending"> {
   await writer.upsert(tenantId, chunk); // parent 无操作，仅 child 落向量/关键词
 
   // 图索引独立于向量/关键词：Neo4j 不可用时不影响前两者就绪（§23.1 多级容错）
-  let graphState = "pending";
   try {
     await graphWriter.upsert(tenantId, chunk);
-    graphState = "ready";
+    return "ready";
   } catch (err) {
     console.warn(
-      `[reconcile] graph index failed for chunk ${chunkId}: ${
+      `[reconcile] graph index failed for chunk ${chunk.id}: ${
         err instanceof Error ? err.message : String(err)
       }`,
     );
-    graphState = "failed";
+    return "failed";
   }
+}
 
+/** 外部派生索引清理（同 writeDerivedIndexes 约束：无 DB 事务） */
+async function removeDerivedIndexes(
+  tenantId: string,
+  chunkId: string,
+): Promise<void> {
+  await writer.remove(tenantId, chunkId);
+  try {
+    await graphWriter.remove(tenantId, chunkId);
+  } catch (err) {
+    console.warn(
+      `[reconcile] graph removal failed for chunk ${chunkId}: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+  }
+}
+
+/** 短事务：幂等写 index_status（chunkId 主键，冲突则更新） */
+async function upsertIndexStatus(
+  tx: Tx,
+  tenantId: string,
+  chunkId: string,
+  graphState: string,
+): Promise<void> {
   await tx
     .insert(indexStatus)
     .values({
@@ -64,23 +87,15 @@ async function applyChunkUpserted(
     });
 }
 
-/** chunk.removed：从派生索引删除 + 删除 index_status */
-async function applyChunkRemoved(
-  tx: Tx,
+/** 短事务：标记 outbox 事件失败（指数退避重试），失败本身不占用长事务 */
+async function markOutboxFailedShort(
   tenantId: string,
-  chunkId: string,
+  id: string,
+  error: string,
 ): Promise<void> {
-  await writer.remove(tenantId, chunkId);
-  try {
-    await graphWriter.remove(tenantId, chunkId);
-  } catch (err) {
-    console.warn(
-      `[reconcile] graph removal failed for chunk ${chunkId}: ${
-        err instanceof Error ? err.message : String(err)
-      }`,
-    );
-  }
-  await tx.delete(indexStatus).where(eq(indexStatus.chunkId, chunkId));
+  await withTenantTx(tenantId, async (tx) => {
+    await markOutboxFailed(tx, id, error);
+  });
 }
 
 /** 派发待处理的 Outbox 事件（幂等，§7.1） */
@@ -91,7 +106,9 @@ async function dispatchOutbox(): Promise<number> {
   let dispatched = 0;
 
   for (const tenantId of tenantIds) {
-    await withTenantTx(tenantId, async (tx) => {
+    // 短事务 1（只读）：拉取待处理事件 + 关联 chunk，事务立即结束、释放连接。
+    // 之后的外部索引调用在事务外执行，避免长时间占用连接池（曾导致池耗尽卡死）。
+    const { events, chunksByAgg } = await withTenantTx(tenantId, async (tx) => {
       const events = await tx
         .select()
         .from(outbox)
@@ -104,27 +121,52 @@ async function dispatchOutbox(): Promise<number> {
         .orderBy(outbox.createdAt)
         .limit(200);
 
+      const chunksByAgg = new Map<string, ChunkRow>();
       for (const e of events) {
-        try {
-          if (e.eventType === "chunk.upserted") {
-            await applyChunkUpserted(tx, e.tenantId, e.aggregateId);
-          } else if (e.eventType === "chunk.removed") {
-            await applyChunkRemoved(tx, e.tenantId, e.aggregateId);
+        if (e.eventType !== "chunk.upserted") continue;
+        const [chunk] = await tx
+          .select()
+          .from(chunks)
+          .where(eq(chunks.id, e.aggregateId))
+          .limit(1);
+        if (chunk) chunksByAgg.set(e.aggregateId, chunk);
+      }
+      return { events, chunksByAgg };
+    });
+
+    for (const e of events) {
+      try {
+        // 外部 I/O（embedding / 向量 / 关键词 / 图 / LLM）：不持有 DB 连接
+        let graphState: string | null = null;
+        if (e.eventType === "chunk.upserted") {
+          const chunk = chunksByAgg.get(e.aggregateId);
+          if (chunk) {
+            graphState = await writeDerivedIndexes(tenantId, chunk);
+          }
+          // chunk 不存在（事件与删除竞争）：无索引可写，仅标记 done
+        } else if (e.eventType === "chunk.removed") {
+          await removeDerivedIndexes(tenantId, e.aggregateId);
+        }
+
+        // 短事务 2（写）：落 index_status + 标记事件 done，事务立即提交
+        await withTenantTx(tenantId, async (tx) => {
+          if (graphState) {
+            await upsertIndexStatus(tx, tenantId, e.aggregateId, graphState);
           }
           await tx
             .update(outbox)
             .set({ status: "done" })
             .where(eq(outbox.id, e.id));
-          dispatched++;
-        } catch (err) {
-          await markOutboxFailed(
-            tx,
-            e.id,
-            err instanceof Error ? err.message : String(err),
-          );
-        }
+        });
+        dispatched++;
+      } catch (err) {
+        await markOutboxFailedShort(
+          tenantId,
+          e.id,
+          err instanceof Error ? err.message : String(err),
+        );
       }
-    });
+    }
   }
 
   return dispatched;
@@ -138,7 +180,8 @@ async function repairIndexStatus(): Promise<number> {
   let repaired = 0;
 
   for (const tenantId of tenantIds) {
-    await withTenantTx(tenantId, async (tx) => {
+    // 短事务 1（只读）：查未就绪的 index_status + 对应 chunk，立即提交释放连接
+    const rows = await withTenantTx(tenantId, async (tx) => {
       // §7.1 对账循环驱动信号：任何一路 != ready 都重新投递（含旧数据遗留的
       // graph=pending，Neo4j 引入前索引的 chunk 在此补建图索引）
       const notReady = await tx
@@ -154,20 +197,41 @@ async function repairIndexStatus(): Promise<number> {
         )
         .limit(200);
 
+      const rows: { chunkId: string; chunk?: ChunkRow }[] = [];
       for (const r of notReady) {
         const [chunk] = await tx
-          .select({ id: chunks.id })
+          .select()
           .from(chunks)
           .where(eq(chunks.id, r.chunkId))
           .limit(1);
-        if (!chunk) {
-          await tx.delete(indexStatus).where(eq(indexStatus.chunkId, r.chunkId));
+        rows.push(chunk ? { chunkId: r.chunkId, chunk } : { chunkId: r.chunkId });
+      }
+      return rows;
+    });
+
+    for (const r of rows) {
+      try {
+        if (!r.chunk) {
+          // 孤儿 index_status（chunk 已删）：直接清掉，无需外部调用
+          await withTenantTx(tenantId, (tx) =>
+            tx.delete(indexStatus).where(eq(indexStatus.chunkId, r.chunkId)),
+          );
         } else {
-          await applyChunkUpserted(tx, tenantId, r.chunkId);
+          // 外部重写派生索引（不持 DB 连接）→ 短事务落 index_status
+          const graphState = await writeDerivedIndexes(tenantId, r.chunk);
+          await withTenantTx(tenantId, (tx) =>
+            upsertIndexStatus(tx, tenantId, r.chunkId, graphState),
+          );
           repaired++;
         }
+      } catch (err) {
+        console.warn(
+          `[reconcile] index repair failed for chunk ${r.chunkId}: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
       }
-    });
+    }
   }
 
   return repaired;
@@ -279,19 +343,29 @@ export interface ReconcileStats {
  * 每一步都按租户隔离遍历；任一步失败由调用方（setInterval / Worker）捕获记录，
  * 不影响下一次对账继续执行。
  */
-export async function runReconcile(): Promise<ReconcileStats> {
-  // 1. 派发 Outbox：幂等落派生索引（核心）
-  const outboxDispatched = await dispatchOutbox();
+let reconcileRunning = false;
 
-  // 2. 修复 index_status：重试失败索引 + 清理孤儿状态
-  const indexRepaired = await repairIndexStatus();
+export async function runReconcile(): Promise<ReconcileStats | null> {
+  // 防重入：上一轮未结束时直接跳过（返回 null），避免 setInterval 周期
+  // （默认 5s）小于单轮耗时导致多个对账并发，长事务叠加重合曾引发连接池耗尽
+  if (reconcileRunning) return null;
+  reconcileRunning = true;
+  try {
+    // 1. 派发 Outbox：幂等落派生索引（核心）
+    const outboxDispatched = await dispatchOutbox();
 
-  // 3. 恢复卡死 Job：重置为 pending 并重新入队
-  const jobsRecovered = await recoverStuckJobs();
+    // 2. 修复 index_status：重试失败索引 + 清理孤儿状态
+    const indexRepaired = await repairIndexStatus();
 
-  // 4. 按需重建社区（图阶段功能）
-  const communitiesRebuilt = await rebuildCommunitiesIfNeeded();
+    // 3. 恢复卡死 Job：重置为 pending 并重新入队
+    const jobsRecovered = await recoverStuckJobs();
 
-  // 汇总统计，供调用方打日志/观测
-  return { outboxDispatched, indexRepaired, jobsRecovered, communitiesRebuilt };
+    // 4. 按需重建社区（图阶段功能）
+    const communitiesRebuilt = await rebuildCommunitiesIfNeeded();
+
+    // 汇总统计，供调用方打日志/观测
+    return { outboxDispatched, indexRepaired, jobsRecovered, communitiesRebuilt };
+  } finally {
+    reconcileRunning = false;
+  }
 }

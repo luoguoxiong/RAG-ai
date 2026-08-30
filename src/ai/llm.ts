@@ -41,6 +41,8 @@ export class OpenAILLMProvider implements LLMProvider {
         temperature: opts.temperature ?? 0.2,
         max_tokens: opts.maxTokens,
       }),
+      // 60s 超时：上游不可达/挂起时快速失败，避免调用方（如 Reconcile）无限等待
+      signal: AbortSignal.timeout(60_000),
     });
     if (!res.ok) {
       throw new Error(`chat request failed: ${res.status} ${await res.text()}`);

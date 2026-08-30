@@ -77,6 +77,8 @@ export class OpenAIEmbeddingProvider implements EmbeddingProvider {
         authorization: `Bearer ${this.apiKey}`,
       },
       body: JSON.stringify(body),
+      // 30s 超时：上游不可达/挂起时快速失败，避免调用方（如 Reconcile）无限等待
+      signal: AbortSignal.timeout(30_000),
     });
     if (!res.ok) {
       throw new Error(`embedding request failed: ${res.status} ${await res.text()}`);

@@ -4,7 +4,15 @@ import { sql } from "drizzle-orm";
 import * as schema from "./schema/index.js";
 import { config } from "../config.js";
 
-export const pool = new Pool({ connectionString: config.databaseUrl });
+export const pool = new Pool({
+  connectionString: config.databaseUrl,
+  // 连接获取超时：池满时快速失败而非无限等待（默认 0 = 永不超时，
+  // 曾导致 Worker 的 markJob 在池耗尽时永久挂起）
+  connectionTimeoutMillis: 10_000,
+  // 兜底：单个事务空闲超过 60s 由服务端自动断开（如外部调用挂起占用连接时），
+  // 防止连接池被"僵尸事务"耗尽；正常短事务远低于此阈值，不影响业务
+  options: "-c idle_in_transaction_session_timeout=60000",
+});
 
 export const db = drizzle(pool, { schema });
 

@@ -20,18 +20,27 @@ import { chunks } from "./chunk";
 export const entities = pgTable(
   "entities",
   {
+    /** 主键：实体 id */
     id: uuid("id").primaryKey().defaultRandom(),
+    /** 租户隔离（跨租户完全隔离） */
     tenantId: uuid("tenant_id")
       .notNull()
       .references(() => tenants.id, { onDelete: "cascade" }),
+    /** 规范名：LLM 抽取并去歧义后的展示名（如 "GraphRAG"） */
     canonicalName: text("canonical_name").notNull(),
+    /** 规范化名：转小写 + 统一变体后的匹配键（唯一索引载体） */
     normalizedName: text("normalized_name").notNull(),
+    /** 实体类型：person / organization / product / concept ... */
     type: text("type").notNull().default("unknown"),
+    /** 别名集合：同一实体的其他写法（匹配时先查规范化名再查别名） */
     aliases: jsonb("aliases").$type<string[]>().notNull().default([]),
+    /** 实体附加元数据（类型描述等） */
     metadata: jsonb("metadata").$type<Record<string, unknown>>().notNull().default({}),
+    /** 创建时间 */
     createdAt: timestamp("created_at", { withTimezone: true })
       .notNull()
       .defaultNow(),
+    /** 最近更新时间 */
     updatedAt: timestamp("updated_at", { withTimezone: true })
       .notNull()
       .defaultNow(),
@@ -53,19 +62,25 @@ export const entities = pgTable(
 export const entityMentions = pgTable(
   "entity_mentions",
   {
+    /** 主键：引用记录 id */
     id: uuid("id").primaryKey().defaultRandom(),
+    /** 租户隔离 */
     tenantId: uuid("tenant_id")
       .notNull()
       .references(() => tenants.id, { onDelete: "cascade" }),
+    /** 提及的切片（切片删除时级联删引用） */
     chunkId: uuid("chunk_id")
       .notNull()
       .references(() => chunks.id, { onDelete: "cascade" }),
+    /** 被提及的实体（实体删除时级联删引用） */
     entityId: uuid("entity_id")
       .notNull()
       .references(() => entities.id, { onDelete: "cascade" }),
+    /** 溯源：该切片所属文档（删除文档时按它减去 MENTIONS 计数） */
     documentId: uuid("document_id")
       .notNull()
       .references(() => documents.id, { onDelete: "cascade" }),
+    /** 创建时间 */
     createdAt: timestamp("created_at", { withTimezone: true })
       .notNull()
       .defaultNow(),
@@ -86,28 +101,38 @@ export const entityMentions = pgTable(
 export const relations = pgTable(
   "relations",
   {
+    /** 主键：关系 id */
     id: uuid("id").primaryKey().defaultRandom(),
+    /** 租户隔离 */
     tenantId: uuid("tenant_id")
       .notNull()
       .references(() => tenants.id, { onDelete: "cascade" }),
+    /** 起始实体（删除时级联删关系） */
     fromEntityId: uuid("from_entity_id")
       .notNull()
       .references(() => entities.id, { onDelete: "cascade" }),
+    /** 目标实体（删除时级联删关系） */
     toEntityId: uuid("to_entity_id")
       .notNull()
       .references(() => entities.id, { onDelete: "cascade" }),
+    /** 关系类型：works_at / mentions / related_to ... */
     type: text("type").notNull(),
+    /** 抽取置信度 [0,1]，LLM 给出；跨文档重复抽取可加权 */
     confidence: doublePrecision("confidence").notNull().default(1),
+    /** 证据溯源：抽取该关系的切片（可空，级联删除） */
     sourceChunkId: uuid("source_chunk_id").references(() => chunks.id, {
       onDelete: "cascade",
     }),
+    /** 证据溯源：所属文档（可空，级联删除） */
     sourceDocumentId: uuid("source_document_id").references(() => documents.id, {
       onDelete: "cascade",
     }),
+    /** 证据溯源：所属文档版本（可空，级联删除） */
     documentVersionId: uuid("document_version_id").references(
       () => documentVersions.id,
       { onDelete: "cascade" },
     ),
+    /** 创建时间 */
     createdAt: timestamp("created_at", { withTimezone: true })
       .notNull()
       .defaultNow(),
@@ -139,16 +164,23 @@ export type NewRelationRow = typeof relations.$inferInsert;
 export const communities = pgTable(
   "communities",
   {
+    /** 主键：社区 id */
     id: uuid("id").primaryKey().defaultRandom(),
+    /** 租户隔离 */
     tenantId: uuid("tenant_id")
       .notNull()
       .references(() => tenants.id, { onDelete: "cascade" }),
+    /** 社区编号（租户内连通分量检测后生成） */
     communityIndex: integer("community_index").notNull(),
+    /** LLM 生成的社区摘要（Global Graph Search 使用） */
     summary: text("summary"),
+    /** 成员实体数（便于展示与剪枝） */
     entityCount: integer("entity_count").notNull().default(0),
+    /** 创建时间 */
     createdAt: timestamp("created_at", { withTimezone: true })
       .notNull()
       .defaultNow(),
+    /** 最近更新时间（实体变动后摘要重建） */
     updatedAt: timestamp("updated_at", { withTimezone: true })
       .notNull()
       .defaultNow(),
@@ -161,16 +193,21 @@ export const communities = pgTable(
 export const communityMembers = pgTable(
   "community_members",
   {
+    /** 主键：成员关系 id */
     id: uuid("id").primaryKey().defaultRandom(),
+    /** 租户隔离 */
     tenantId: uuid("tenant_id")
       .notNull()
       .references(() => tenants.id, { onDelete: "cascade" }),
+    /** 所属社区（社区删除时级联删成员） */
     communityId: uuid("community_id")
       .notNull()
       .references(() => communities.id, { onDelete: "cascade" }),
+    /** 社区内实体（实体删除时级联删成员） */
     entityId: uuid("entity_id")
       .notNull()
       .references(() => entities.id, { onDelete: "cascade" }),
+    /** 创建时间 */
     createdAt: timestamp("created_at", { withTimezone: true })
       .notNull()
       .defaultNow(),
