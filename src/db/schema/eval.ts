@@ -13,13 +13,21 @@ import { tenants } from "./tenant";
 
 /** 单个查询的评估指标（§22）：检索 4 项 + 生成 4 项，均归一化到 [0,1] */
 export interface EvalMetrics {
+  /** Top-K 召回率：在前 K 条召回结果中命中相关文档的比例，衡量检索的查全能力 */
   recallAtK: number;
+  /** 命中率：查询的 Top-K 结果中是否至少包含一条相关文档（0/1），衡量检索是否命中 */
   hitRate: number;
+  /** 平均倒数排名（MRR）：第一条相关文档位置的倒数，越靠前得分越高，衡量排序质量 */
   mrr: number;
+  /** NDCG（归一化折损累计增益）：考虑相关度等级与位置的排名质量评分，越接近 1 越好 */
   ndcg: number;
+  /** 上下文精确率：召回上下文中相关条目占比，衡量检索结果的噪声控制 */
   contextPrecision: number;
+  /** 上下文召回率：相关上下文被召回到的比例，衡量检索对答案所需信息的覆盖度 */
   contextRecall: number;
+  /** 忠实度：生成答案基于给定上下文的比例，衡量是否存在幻觉（无中生有） */
   faithfulness: number;
+  /** 答案相关性：生成答案与用户问题意图的匹配程度，衡量回答是否切题 */
   answerRelevance: number;
 }
 
