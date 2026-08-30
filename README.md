@@ -177,7 +177,7 @@ curl -X POST http://localhost:3000/search \
 | 变量 | 默认 | 说明 |
 | --- | --- | --- |
 | `DATABASE_URL` | `postgres://rag:rag@localhost:5432/rag` | PostgreSQL 连接串 |
-| `REDIS_URL` | `redis://localhost:6379` | Redis 连接串（队列 + 缓存） |
+| `REDIS_URL` | `redis://localhost:6380` | Redis 连接串（队列 + 缓存） |
 | `PORT` / `HOST` | `3000` / `0.0.0.0` | API 监听 |
 | `QDRANT_URL` | `http://localhost:6333` | 向量库 |
 | `OPENSEARCH_URL` | `http://localhost:9200` | 关键词检索 |
