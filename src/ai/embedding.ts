@@ -32,6 +32,11 @@ export class OpenAIEmbeddingProvider implements EmbeddingProvider {
   private readonly baseUrl: string;
   private readonly modelName: string;
   private readonly dims: number;
+  /**
+   * 是否走多模态向量化接口（/embeddings/multimodal）。
+   * 火山方舟的 doubao-embedding-vision 仅支持该接口：input 为结构化对象、data 为单对象而非数组。
+   */
+  private readonly isMultimodal: boolean;
 
   constructor(opts: {
     apiKey: string;
@@ -43,6 +48,7 @@ export class OpenAIEmbeddingProvider implements EmbeddingProvider {
     this.baseUrl = opts.baseUrl;
     this.modelName = opts.model;
     this.dims = opts.dimensions;
+    this.isMultimodal = opts.model.startsWith("doubao-embedding-vision");
   }
 
   model(): string {
@@ -54,19 +60,37 @@ export class OpenAIEmbeddingProvider implements EmbeddingProvider {
   }
 
   async embed(texts: string[]): Promise<number[][]> {
-    const res = await fetch(`${this.baseUrl}/embeddings`, {
+    const path = this.isMultimodal ? "embeddings/multimodal" : "embeddings";
+    const body = this.isMultimodal
+      ? {
+          model: this.modelName,
+          encoding_format: "float",
+          // doubao-embedding-vision 可选维度为 1024 / 2048，需与 Qdrant 集合保持一致
+          dimensions: this.dims,
+          input: texts.map((text) => ({ type: "text", text })),
+        }
+      : { model: this.modelName, input: texts };
+    const res = await fetch(`${this.baseUrl}/${path}`, {
       method: "POST",
       headers: {
         "content-type": "application/json",
         authorization: `Bearer ${this.apiKey}`,
       },
-      body: JSON.stringify({ model: this.modelName, input: texts }),
+      body: JSON.stringify(body),
     });
     if (!res.ok) {
       throw new Error(`embedding request failed: ${res.status} ${await res.text()}`);
     }
-    const json = (await res.json()) as { data?: { embedding: number[] }[] };
-    const embeddings = (json.data ?? []).map((d) => d.embedding);
+    const json = (await res.json()) as {
+      data?: { embedding?: number[] } | { embedding?: number[] }[];
+    };
+    // 多模态接口 data 为单对象，标准接口为数组，统一归一化为数组
+    const dataList = Array.isArray(json.data)
+      ? json.data
+      : json.data
+        ? [json.data]
+        : [];
+    const embeddings = dataList.map((d) => d.embedding ?? []);
     if (embeddings.length !== texts.length) {
       throw new Error("embedding response dimension mismatch");
     }

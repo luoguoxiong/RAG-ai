@@ -1,4 +1,5 @@
 import Fastify from "fastify";
+import cors from "@fastify/cors";
 import multipart from "@fastify/multipart";
 import { eq } from "drizzle-orm";
 import { config } from "./config.js";
@@ -48,6 +49,8 @@ async function startup(): Promise<void> {
   await ensureDemoTenant();
 
   const app = Fastify({ logger: false });
+  // 允许前端（vite :5173）跨域访问；生产可收紧为具体域名
+  await app.register(cors, { origin: true });
   await app.register(multipart, { limits: { fileSize: 10 * 1024 * 1024 } });
   await app.register(documentRoutes);
   await app.register(versionRoutes);

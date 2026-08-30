@@ -182,8 +182,8 @@ curl -X POST http://localhost:3000/search \
 | `QDRANT_URL` | `http://localhost:6333` | 向量库 |
 | `OPENSEARCH_URL` | `http://localhost:9200` | 关键词检索 |
 | `NEO4J_URL` / `NEO4J_USER` / `NEO4J_PASSWORD` | `bolt://localhost:7687` / `neo4j` / `ragrag1234` | 图谱 |
-| `OPENAI_API_KEY` / `OPENAI_BASE_URL` / `LLM_MODEL` | - / 官方 / `gpt-4o-mini` | LLM Provider |
-| `EMBEDDING_MODEL` / `EMBEDDING_DIMENSIONS` | `text-embedding-3-small` / `384` | Embedding Provider |
+| `OPENAI_API_KEY` / `OPENAI_BASE_URL` / `LLM_MODEL` | - / `https://ark.cn-beijing.volces.com/api/plan/v3` / `doubao-seed-2.0-lite` | LLM Provider（火山方舟 Agent Plan） |
+| `EMBEDDING_MODEL` / `EMBEDDING_DIMENSIONS` | `doubao-embedding-vision` / `2048` | Embedding Provider（方舟多模态向量化接口，可选 1024/2048） |
 | `QUERY_INTELLIGENCE_ENABLED` | `true` | 查询智能总开关 |
 | `DEFAULT_TOP_K` / `DEFAULT_MAX_HOPS` | `6` / `2` | 检索默认参数 |
 | `RETRIEVER_TIMEOUT_MS` | `3000` | 单 Retriever 超时 |

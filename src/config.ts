@@ -1,3 +1,15 @@
+import { existsSync } from "node:fs";
+import { resolve } from "node:path";
+
+// tsx / node 默认不加载 .env，这里显式加载，使 .env 中的配置（含 API Key）生效。
+// 依赖 Node 20.12+ 内置 process.loadEnvFile；文件缺失或解析失败时静默回退默认值。
+try {
+  const envFile = resolve(process.cwd(), ".env");
+  if (existsSync(envFile)) process.loadEnvFile(envFile);
+} catch {
+  // ignore: 无 .env 时使用默认配置
+}
+
 export const config = {
   databaseUrl:
     process.env.DATABASE_URL ?? "postgres://rag:rag@localhost:5432/rag",
@@ -18,14 +30,18 @@ export const config = {
   neo4jUser: process.env.NEO4J_USER ?? "neo4j",
   neo4jPassword: process.env.NEO4J_PASSWORD ?? "ragrag1234",
   // Embedding / LLM Provider（OpenAI 兼容；未配置 key 时回退到确定性实现）
+  // 火山方舟 Agent Plan（套餐）模式：开启「超额后付费」后，额度用尽会自动切换后付费，无需改配置
+  // 注意：向量模型 doubao-embedding-vision 不支持 Auto 及控制台切换，必须在配置中显式指定模型名
+  // 配置指南参考：https://docs.volcengine.com/docs/82379/2373738（Agent Plan 快速开始）
   embedding: {
-    model: process.env.EMBEDDING_MODEL ?? "text-embedding-3-small",
-    dimensions: Number(process.env.EMBEDDING_DIMENSIONS ?? 384),
+    model: process.env.EMBEDDING_MODEL ?? "doubao-embedding-vision",
+    dimensions: Number(process.env.EMBEDDING_DIMENSIONS ?? 2048),
   },
   openai: {
     apiKey: process.env.OPENAI_API_KEY ?? "",
-    baseUrl: process.env.OPENAI_BASE_URL ?? "https://api.openai.com/v1",
-    model: process.env.LLM_MODEL ?? "gpt-4o-mini",
+    baseUrl:
+      process.env.OPENAI_BASE_URL ?? "https://ark.cn-beijing.volces.com/api/plan/v3",
+    model: process.env.LLM_MODEL ?? "doubao-seed-2.0-lite",
   },
   // 检索默认 topK
   defaultTopK: Number(process.env.DEFAULT_TOP_K ?? 6),
