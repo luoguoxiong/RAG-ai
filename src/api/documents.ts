@@ -54,8 +54,10 @@ export async function documentRoutes(app: FastifyInstance): Promise<void> {
       | Array<{ value?: unknown }>
       | undefined;
     const rawValue = Array.isArray(raw) ? raw[0]?.value : raw?.value;
+
     const versionId =
       typeof rawValue === "string" && rawValue.length > 0 ? rawValue : undefined;
+      
     if (!versionId) {
       return reply.code(400).send({ error: "versionId field is required" });
     }
