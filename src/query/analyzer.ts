@@ -11,15 +11,17 @@ import { DeterministicEntityExtractor } from "../ingestion/graph/extractor.js";
 /** 检索来源（§15） */
 export type RetrievalSource = "vector" | "keyword" | "graph" | "sql";
 
+/** 查询意图（§13）：决定检索来源与变换选择 */
 export type QueryIntent =
-  | "fact"
-  | "relationship"
-  | "multi_hop"
-  | "aggregation"
-  | "comparison"
-  | "code"
-  | "unknown";
+  | "fact" // 事实型：单点事实问答（什么是/如何）
+  | "relationship" // 关系型：实体间关系（…与…的关系，走图）
+  | "multi_hop" // 多跳：原因/影响等推理链
+  | "aggregation" // 聚合统计：多少/列表/总数
+  | "comparison" // 对比：区别/优劣/vs
+  | "code" // 代码 / 接口 / 算法相关
+  | "unknown"; // 无法判定：升级到 LLM 分析 / LLM Router
 
+/** 查询复杂度：与变换选择、topK 相关 */
 export type QueryComplexity = "simple" | "medium" | "complex";
 
 export interface QueryAnalysis {

@@ -7,17 +7,26 @@ import {
 } from "../query/index.js";
 
 export interface Citation {
+  /** 引用编号，从 1 开始，与回答正文中的 [n] 一一对应 */
   index: number;
+  /** 文档标题（无标题时为空串） */
   title: string;
+  /** 命中的文档 ID */
   documentId: string;
+  /** 命中的 chunk ID */
   chunkId: string;
+  /** 证据最终得分：重排后为重排分，未重排时为融合分 */
   score: number;
 }
 
 export interface SearchResult {
+  /** 原始查询文本 */
   query: string;
+  /** LLM 生成的回答（含 [n] 引用标记） */
   answer: string;
+  /** 引用来源列表，与回答中的 [n] 对应 */
   citations: Citation[];
+  /** 送入 LLM 的证据条数 */
   evidenceCount: number;
   /** Phase 5 Query Intelligence：分析 / 路由 / 实际检索文本（可观测性，§23） */
   analysis?: QueryIntelligenceResult["analysis"];
@@ -71,6 +80,7 @@ export async function answerQuery(
   topK?: number,
   opts?: { intelligence?: boolean; documentIds?: string[] },
 ): Promise<SearchResult> {
+  // 归一化 topK；是否启用 Query Intelligence = 全局开关 && 请求未显式关闭
   const k = topK ?? config.defaultTopK;
   const enabled = config.queryIntelligence.enabled && (opts?.intelligence ?? true);
   const documentIds = opts?.documentIds;
@@ -78,14 +88,18 @@ export async function answerQuery(
   let evidence: Evidence[];
   let qi: QueryIntelligenceResult | undefined;
   if (enabled) {
+    // 智能链路：分析 -> 路由 -> 变换 -> 检索，附带 analysis/plan 供可观测性
     qi = await runQueryIntelligence(tenantId, query, k, documentIds);
     evidence = qi.evidence;
   } else {
+    // 直连链路：跳过 Query Intelligence，直接混合检索
     evidence = await retrieveEvidence(tenantId, query, k, { documentIds });
   }
 
+  // Context Builder -> LLM 生成带 [n] 引用的回答
   const answer = await generateAnswer(query, evidence);
 
+  // 按证据顺序生成引用列表，index 与回答正文中的 [n] 一一对应
   const citations: Citation[] = evidence.map((e, i) => ({
     index: i + 1,
     title: e.title,
@@ -99,6 +113,7 @@ export async function answerQuery(
     answer,
     citations,
     evidenceCount: evidence.length,
+    // Query Intelligence 可观测字段：未启用时为 undefined
     analysis: qi?.analysis,
     plan: qi?.plan,
     effectiveQueries: qi?.effectiveQueries,

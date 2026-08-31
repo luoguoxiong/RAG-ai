@@ -124,6 +124,7 @@ export async function resolveVersionDocumentIds(
   versionId?: string,
 ): Promise<string[]> {
   return withTenantTx(tenantId, async (tx) => {
+    // 按指定 id 或激活版本（缺省）定位版本；找不到则抛错（API 层转 400）
     const version = await findVersion(tx, tenantId, versionId);
     if (!version) {
       throw new Error(
@@ -133,6 +134,7 @@ export async function resolveVersionDocumentIds(
       );
     }
 
+    // 展开版本下全部文档 id，作为检索 / 图遍历的过滤集合
     const rows = await tx
       .select({ id: documents.id })
       .from(documents)

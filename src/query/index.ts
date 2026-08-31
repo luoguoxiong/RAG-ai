@@ -71,8 +71,11 @@ export async function runQueryIntelligence(
   documentIds?: string[],
 ): Promise<QueryIntelligenceResult> {
   const k = topK ?? config.defaultTopK;
+  // 1) 分析：规则优先，低置信且有 API key 时升级 LLM 分析
   const analysis = await analyzeQuery(query);
+  // 2) 路由：高置信直连规则路由，低置信走 LLM 路由
   const plan = await routeQuery(query, analysis, k);
+  // 3) 变换 + 检索：按分析结果选择 Rewrite / Multi Query / HyDE / Direct
   const { effectiveQueries, evidence } = await transformAndRetrieve(
     tenantId,
     query,
@@ -81,6 +84,7 @@ export async function runQueryIntelligence(
     k,
     documentIds,
   );
+  // 附带 analysis/plan/effectiveQueries 供可观测性（§23）
   return { analysis, plan, effectiveQueries, evidence };
 }
 

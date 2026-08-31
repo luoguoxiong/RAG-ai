@@ -1,3 +1,13 @@
+/**
+ * Retriever 层（§16）：统一检索入口。
+ *
+ * 流程：VectorRetriever（向量路）与 KeywordRetriever（关键词路）并行检索
+ * → RRF 融合（rrf.ts）去量纲合并 → 回表 parent content 组装 Evidence
+ * → Reranker 重排（reranker.ts，可选）。
+ *
+ * 容错（§23.1）：关键词索引不可用时降级为纯向量路；
+ * 版本过滤在回表阶段兜底（assembleEvidence 内二次校验）。
+ */
 import { inArray } from "drizzle-orm";
 import { withTenantTx } from "../db/index.js";
 import { chunks, type ChunkRow } from "../db/schema/chunk.js";
@@ -26,6 +36,7 @@ export interface RetrievalHit {
   source: "vector" | "keyword";
 }
 
+/** 向量路检索：query 嵌入 -> Qdrant 相似度检索 -> 归一化为 RetrievalHit */
 export class VectorRetriever implements Retriever {
   async retrieve(
     tenantId: string,
@@ -33,6 +44,7 @@ export class VectorRetriever implements Retriever {
     topK: number,
     documentIds?: string[],
   ): Promise<RetrievalHit[]> {
+    // query 向量化；无向量（如空文本）时直接返回空
     const [vector] = await getEmbedding().embed([query]);
     if (!vector) return [];
     const hits = await getVectorStore().search(tenantId, vector, topK, {
@@ -46,6 +58,7 @@ export class VectorRetriever implements Retriever {
   }
 }
 
+/** 关键词路检索：OpenSearch BM25 检索；索引不可用时降级为空结果 */
 export class KeywordRetriever implements Retriever {
   async retrieve(
     tenantId: string,
