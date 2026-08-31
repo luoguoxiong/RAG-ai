@@ -24,13 +24,21 @@ export type QueryIntent =
 /** 查询复杂度：与变换选择、topK 相关 */
 export type QueryComplexity = "simple" | "medium" | "complex";
 
+/** 查询分析结果（§13）：Query Analyzer 的输出，驱动 Router 与变换选择 */
 export interface QueryAnalysis {
+  /** 查询意图：决定检索来源与变换选择 */
   intent: QueryIntent;
+  /** 提取出的实体名（已去重、过滤停用词，最多 5 个） */
   entities: string[];
+  /** 查询复杂度：与变换选择、topK 相关 */
   complexity: QueryComplexity;
+  /** 是否包含指代（它/这个/相关 等），需要改写（补全实体上下文） */
   needsRewrite: boolean;
+  /** 是否复杂到需要多路查询（拆分子查询后分别检索再融合） */
   needsMultiQuery: boolean;
+  /** 是否需要用 HyDE（假设性文档）提升语义召回 */
   needsHyDE: boolean;
+  /** 建议的检索来源，按优先级排序（vector/keyword/graph/sql） */
   suggestedSources: RetrievalSource[];
 }
 

@@ -161,6 +161,24 @@ export interface RetrieveOptions {
   documentIds?: string[];
 }
 
+/**
+ * 检索证据（§10 主入口）：对 query 做混合检索并返回按相关度排序的证据列表。
+ *
+ * 流程：
+ * 1. 并行执行 Vector（向量）与 Keyword（关键词）两路检索，各取 topK 条；
+ * 2. 对两路结果做 RRF（Reciprocal Rank Fusion）融合，按融合分截取 topK；
+ * 3. 根据融合出的 chunkId 回表 PostgreSQL 组装完整 Evidence（含原文、标题、父子块等）；
+ * 4. 合并各路得分（vectorScore / keywordScore / fusionScore）并标注来源 source
+ *    （仅向量→"vector"，仅关键词→"keyword"，双路命中→"hybrid"）；
+ * 5. 默认用 Reranker 重排（§19）；opts.useReranker=false 时跳过重排，
+ *    直接按融合分排序返回（§23.1 降级路径，由 RetrievalPlan.useReranker 驱动，§15）。
+ *
+ * @param tenantId 租户 ID，用于多租户隔离
+ * @param query    用户查询文本
+ * @param topK     返回的证据条数上限
+ * @param opts     检索选项，如关闭重排、限定文档范围
+ * @returns 按相关度排序的 Evidence 数组
+ */
 export async function retrieveEvidence(
   tenantId: string,
   query: string,
@@ -168,21 +186,27 @@ export async function retrieveEvidence(
   opts: RetrieveOptions = {},
 ): Promise<Evidence[]> {
   const { documentIds } = opts;
+
+  // 1. 并行执行两路检索：向量（语义）检索 + 关键词（BM25）检索，各取 topK 条
   const [vectorHits, keywordHits] = await Promise.all([
     new VectorRetriever().retrieve(tenantId, query, topK, documentIds),
     new KeywordRetriever().retrieve(tenantId, query, topK, documentIds),
   ]);
 
+  // 记录两路检索的原始得分，供后续合并到 Evidence 上
   const vectorScore = new Map(vectorHits.map((h) => [h.id, h.score]));
   const keywordScore = new Map(keywordHits.map((h) => [h.id, h.score]));
 
+  // 2. RRF 融合：将两路各自的排序位置折算为融合分，取 topK
   const fused = reciprocalRankFusion([
     vectorHits.map((h, i) => ({ source: "vector", id: h.id, rank: i + 1 })),
     keywordHits.map((h, i) => ({ source: "keyword", id: h.id, rank: i + 1 })),
   ]).slice(0, topK);
 
+  // 没有命中直接返回空
   if (fused.length === 0) return [];
 
+  // 提取融合分与来源标注：双路命中→hybrid，单路命中→对应来源
   const fusionScore = new Map(fused.map((f) => [f.id, f.score]));
   const sourceById = new Map(
     fused.map((f) => [
@@ -191,12 +215,14 @@ export async function retrieveEvidence(
     ]),
   );
 
+  // 3. 按融合出的 chunkId 回表数据库，组装完整 Evidence（原文、标题、父子块等）
   const evidence = await assembleEvidence(
     tenantId,
     fused.map((f) => f.id),
     documentIds,
   );
 
+  // 4. 合并各路得分与来源，默认以融合分作为排序依据
   for (const e of evidence) {
     e.vectorScore = vectorScore.get(e.chunkId);
     e.keywordScore = keywordScore.get(e.chunkId);
@@ -206,10 +232,12 @@ export async function retrieveEvidence(
     e.score = e.fusionScore ?? 0;
   }
 
+  // 关闭重排的降级路径：直接按融合分排序返回
   if (opts.useReranker === false) {
     return evidence;
   }
 
+  // 5. Rerank 重排：以融合分为输入，交给 Reranker 重新打分排序
   const reranked = await getReranker().rerank(
     query,
     evidence.map((e) => ({
@@ -219,6 +247,7 @@ export async function retrieveEvidence(
     })),
   );
 
+  // 按重排后的顺序重建 Evidence，覆盖 score / rerankScore / 证据 id
   const byChunk = new Map(evidence.map((e) => [e.chunkId, e]));
   const ordered: Evidence[] = [];
   for (const r of reranked) {
