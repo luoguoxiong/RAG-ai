@@ -2,10 +2,18 @@ import { useState, type KeyboardEvent } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { Loader2, Send } from "lucide-react";
 import { api } from "../../api/client";
+import { Badge } from "../../components/ui/badge";
 import { Button } from "../../components/ui/button";
 import { Card, CardContent } from "../../components/ui/card";
 import { Textarea } from "../../components/ui/textarea";
 import { Input } from "../../components/ui/input";
+
+/** 指标值染色：>=0.7 绿、>=0.4 黄、否则红 */
+function metricColor(v: number): string {
+  if (v >= 0.7) return "bg-green-100 text-green-700";
+  if (v >= 0.4) return "bg-amber-100 text-amber-700";
+  return "bg-red-100 text-red-700";
+}
 
 /** 将答案中的 [n] 引用高亮显示 */
 function renderAnswer(answer: string) {
@@ -28,9 +36,28 @@ export default function ChatPage() {
   const [query, setQuery] = useState("");
   const [topK, setTopK] = useState(6);
   const [intelligence, setIntelligence] = useState(true);
+  const [goldIds, setGoldIds] = useState("");
 
   const search = useMutation({
-    mutationFn: () => api.search({ query, topK, intelligence }),
+    mutationFn: () => {
+      // 解析可选的 ground truth（黄金 chunk ids）：JSON 字符串数组
+      let goldChunkIds: string[] | undefined;
+      if (goldIds.trim()) {
+        try {
+          const parsed = JSON.parse(goldIds) as unknown;
+          if (
+            !Array.isArray(parsed) ||
+            parsed.some((x) => typeof x !== "string")
+          ) {
+            throw new Error();
+          }
+          goldChunkIds = parsed;
+        } catch {
+          throw new Error('gold chunk ids 需为字符串数组 JSON，如 ["chunk-uuid-1"]');
+        }
+      }
+      return api.search({ query, topK, intelligence, goldChunkIds });
+    },
     onSuccess: () => {
       // 检索落库后刷新历史页缓存
       qc.invalidateQueries({ queryKey: ["retrieval-logs"] });
@@ -53,9 +80,9 @@ export default function ChatPage() {
 
   return (
     <div className="flex h-full flex-col">
-      <header className="flex items-center justify-between border-b bg-white px-6 py-4">
+      <header className="flex flex-wrap items-center justify-between gap-3 border-b bg-white px-6 py-4">
         <h1 className="text-lg font-semibold">检索问答</h1>
-        <div className="flex items-center gap-4 text-sm text-zinc-600">
+        <div className="flex flex-wrap items-center gap-4 text-sm text-zinc-600">
           <label className="flex items-center gap-2">
             topK
             <Input
@@ -74,6 +101,17 @@ export default function ChatPage() {
             />
             查询智能
           </label>
+          <label className="flex items-center gap-2">
+            <span className="whitespace-nowrap" title="可选的黄金 chunk ids，提供后计算 Recall@K / Hit Rate / MRR / NDCG">
+              gold ids
+            </span>
+            <Input
+              value={goldIds}
+              onChange={(e) => setGoldIds(e.target.value)}
+              placeholder={'["chunk-uuid-1"]'}
+              className="h-8 w-52 font-mono text-xs"
+            />
+          </label>
         </div>
       </header>
 
@@ -91,6 +129,28 @@ export default function ChatPage() {
               <div className="whitespace-pre-wrap leading-relaxed">
                 {renderAnswer(data.answer)}
               </div>
+
+              {data.retrievalMetrics && (
+                <div className="border-t pt-4">
+                  <h3 className="mb-2 text-sm font-medium text-zinc-600">
+                    检索质量指标（基于提供的 gold ids）
+                  </h3>
+                  <div className="flex flex-wrap gap-1.5">
+                    {(
+                      [
+                        ["Recall@K", data.retrievalMetrics.recallAtK],
+                        ["Hit Rate", data.retrievalMetrics.hitRate],
+                        ["MRR", data.retrievalMetrics.mrr],
+                        ["NDCG", data.retrievalMetrics.ndcg],
+                      ] as [string, number][]
+                    ).map(([label, v]) => (
+                      <Badge key={label} className={metricColor(v)}>
+                        {label} {v.toFixed(3)}
+                      </Badge>
+                    ))}
+                  </div>
+                </div>
+              )}
 
               <div className="border-t pt-4">
                 <h3 className="mb-2 text-sm font-medium text-zinc-600">

@@ -55,6 +55,8 @@ export const api = {
     topK?: number;
     intelligence?: boolean;
     versionId?: string;
+    /** 可选的 ground truth（黄金 chunk ids），提供后返回并记录 Recall@K / Hit Rate / MRR / NDCG */
+    goldChunkIds?: string[];
   }): Promise<SearchResult> {
     return request<SearchResult>("/search", {
       method: "POST",

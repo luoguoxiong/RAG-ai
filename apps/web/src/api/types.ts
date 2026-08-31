@@ -6,6 +6,13 @@ export interface Citation {
   score: number;
 }
 
+export interface RetrievalMetrics {
+  recallAtK: number;
+  hitRate: number;
+  mrr: number;
+  ndcg: number;
+}
+
 export interface SearchResult {
   query: string;
   answer: string;
@@ -14,6 +21,8 @@ export interface SearchResult {
   analysis?: unknown;
   plan?: unknown;
   effectiveQueries?: string[];
+  /** 检索质量指标：请求提供了 goldChunkIds 时返回 */
+  retrievalMetrics?: RetrievalMetrics;
 }
 
 export interface DocumentRow {
@@ -147,6 +156,11 @@ export interface RetrievalLog {
   evidenceCount: number;
   citationCount: number;
   topScore: number | null;
+  /** 检索质量指标：仅请求提供了 gold chunk ids 时有值，否则为 null */
+  recallAtK: number | null;
+  hitRate: number | null;
+  mrr: number | null;
+  ndcg: number | null;
   effectiveQueries: string[];
   chunkIds: string[];
   retrievalMs: number | null;

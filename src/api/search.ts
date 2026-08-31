@@ -43,6 +43,8 @@ interface SearchBody {
   intelligence?: boolean;
   /** 数据集版本：检索只在该版本包含的文档集合内召回；不传则用激活版本 */
   versionId?: string;
+  /** 可选的 ground truth（黄金 chunk ids），提供后计算并记录 Recall@K / Hit Rate / MRR / NDCG */
+  goldChunkIds?: string[];
 }
 
 /**
@@ -89,9 +91,13 @@ export async function searchRoutes(app: FastifyInstance): Promise<void> {
         ? req.body.topK
         : undefined;
     const intelligence = req.body?.intelligence;
+    const goldChunkIds = Array.isArray(req.body?.goldChunkIds)
+      ? req.body.goldChunkIds
+      : undefined;
     const result = await answerQuery(tenantId, query, topK, {
       intelligence,
       documentIds,
+      goldChunkIds,
     });
 
     // 异步写入检索日志（不阻塞响应）
@@ -107,6 +113,10 @@ export async function searchRoutes(app: FastifyInstance): Promise<void> {
         evidenceCount: result.evidenceCount,
         citationCount: result.citations.length,
         topScore,
+        recallAtK: result.retrievalMetrics?.recallAtK,
+        hitRate: result.retrievalMetrics?.hitRate,
+        mrr: result.retrievalMetrics?.mrr,
+        ndcg: result.retrievalMetrics?.ndcg,
         effectiveQueries: result.effectiveQueries ?? [],
         chunkIds: result.citations.map((c) => c.chunkId),
         retrievalMs: result.retrievalMs,

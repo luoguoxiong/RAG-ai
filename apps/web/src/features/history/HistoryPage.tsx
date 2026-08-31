@@ -116,6 +116,46 @@ export default function HistoryPage() {
                 </span>
               </div>
 
+              {/* 有 ground truth 的记录的检索质量指标平均 */}
+              {(() => {
+                const withGold = logList.filter((l) => l.recallAtK != null);
+                if (withGold.length === 0) return null;
+                const avg = (k: "recallAtK" | "hitRate" | "mrr" | "ndcg") =>
+                  withGold.reduce((s, l) => s + (l[k] ?? 0), 0) /
+                  withGold.length;
+                return (
+                  <div className="mb-4 flex flex-wrap items-center gap-4 text-sm">
+                    <span className="text-xs text-zinc-400">
+                      ground truth 记录（{withGold.length}）平均：
+                    </span>
+                    <span className="text-zinc-500">
+                      召回率{" "}
+                      <span className="font-medium text-zinc-700">
+                        {avg("recallAtK").toFixed(3)}
+                      </span>
+                    </span>
+                    <span className="text-zinc-500">
+                      命中率{" "}
+                      <span className="font-medium text-zinc-700">
+                        {avg("hitRate").toFixed(3)}
+                      </span>
+                    </span>
+                    <span className="text-zinc-500">
+                      MRR{" "}
+                      <span className="font-medium text-zinc-700">
+                        {avg("mrr").toFixed(3)}
+                      </span>
+                    </span>
+                    <span className="text-zinc-500">
+                      NDCG{" "}
+                      <span className="font-medium text-zinc-700">
+                        {avg("ndcg").toFixed(3)}
+                      </span>
+                    </span>
+                  </div>
+                );
+              })()}
+
               {/* ── 列表 ── */}
               <div className="overflow-x-auto">
                 <table className="w-full text-sm">
@@ -126,6 +166,18 @@ export default function HistoryPage() {
                       <th className="py-2 pr-3 font-medium">参数</th>
                       <th className="py-2 pr-3 font-medium">引用</th>
                       <th className="py-2 pr-3 font-medium">最高分</th>
+                      <th className="py-2 pr-3 font-medium" title="提供 gold ids 时计算，否则为 -">
+                        Recall@K
+                      </th>
+                      <th className="py-2 pr-3 font-medium" title="提供 gold ids 时计算，否则为 -">
+                        Hit Rate
+                      </th>
+                      <th className="py-2 pr-3 font-medium" title="提供 gold ids 时计算，否则为 -">
+                        MRR
+                      </th>
+                      <th className="py-2 pr-3 font-medium" title="提供 gold ids 时计算，否则为 -">
+                        NDCG
+                      </th>
                       <th className="py-2 pr-3 font-medium">检索耗时</th>
                       <th className="py-2 pr-3 font-medium">生成耗时</th>
                       <th className="py-2 pr-3 font-medium">总耗时</th>
@@ -176,6 +228,28 @@ export default function HistoryPage() {
                               </Badge>
                             </td>
                             <td className="py-2 pr-3">
+                              <Badge className={scoreColor(log.recallAtK)}>
+                                {log.recallAtK != null
+                                  ? log.recallAtK.toFixed(3)
+                                  : "-"}
+                              </Badge>
+                            </td>
+                            <td className="py-2 pr-3">
+                              <Badge className={scoreColor(log.hitRate)}>
+                                {log.hitRate != null ? log.hitRate.toFixed(3) : "-"}
+                              </Badge>
+                            </td>
+                            <td className="py-2 pr-3">
+                              <Badge className={scoreColor(log.mrr)}>
+                                {log.mrr != null ? log.mrr.toFixed(3) : "-"}
+                              </Badge>
+                            </td>
+                            <td className="py-2 pr-3">
+                              <Badge className={scoreColor(log.ndcg)}>
+                                {log.ndcg != null ? log.ndcg.toFixed(3) : "-"}
+                              </Badge>
+                            </td>
+                            <td className="py-2 pr-3">
                               <Badge className={latencyColor(log.retrievalMs)}>
                                 {formatMs(log.retrievalMs)}
                               </Badge>
@@ -200,7 +274,7 @@ export default function HistoryPage() {
                           </tr>
                           {expanded && (
                             <tr key={`${log.id}-detail`}>
-                              <td colSpan={9} className="bg-zinc-50 px-4 py-3">
+                              <td colSpan={13} className="bg-zinc-50 px-4 py-3">
                                 <div className="space-y-3">
                                   {/* 查询详情 */}
                                   {log.effectiveQueries.length > 0 && (

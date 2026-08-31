@@ -5,6 +5,7 @@ import {
   runQueryIntelligence,
   type QueryIntelligenceResult,
 } from "../query/index.js";
+import { evaluateRetrieval, type RetrievalMetrics } from "../evaluation/metrics.js";
 
 export interface Citation {
   /** 引用编号，从 1 开始，与回答正文中的 [n] 一一对应 */
@@ -38,6 +39,8 @@ export interface SearchResult {
   generationMs?: number;
   /** 总耗时（毫秒） */
   latencyMs?: number;
+  /** 检索质量指标（Recall@K / Hit Rate / MRR / NDCG）：仅请求提供了 goldChunkIds 时计算 */
+  retrievalMetrics?: RetrievalMetrics;
 }
 
 /** Context Builder（§20）：把 Evidence 序列化为带引用编号的提示词上下文。 */
@@ -84,7 +87,12 @@ export async function answerQuery(
   tenantId: string,
   query: string,
   topK?: number,
-  opts?: { intelligence?: boolean; documentIds?: string[] },
+  opts?: {
+    intelligence?: boolean;
+    documentIds?: string[];
+    /** 可选的 ground truth（黄金 chunk ids），提供后计算 Recall@K / Hit Rate / MRR / NDCG */
+    goldChunkIds?: string[];
+  },
 ): Promise<SearchResult> {
   // 归一化 topK；是否启用 Query Intelligence = 全局开关 && 请求未显式关闭
   const k = topK ?? config.defaultTopK;
@@ -122,6 +130,16 @@ export async function answerQuery(
     score: e.score,
   }));
 
+  // 检索质量指标：提供 ground truth 时才计算（复用评估系统的纯函数）
+  const retrievalMetrics =
+    opts?.goldChunkIds && opts.goldChunkIds.length > 0
+      ? evaluateRetrieval(
+          opts.goldChunkIds,
+          evidence.map((e) => e.chunkId),
+          k,
+        )
+      : undefined;
+
   return {
     query,
     answer,
@@ -134,5 +152,6 @@ export async function answerQuery(
     retrievalMs,
     generationMs,
     latencyMs,
+    retrievalMetrics,
   };
 }
