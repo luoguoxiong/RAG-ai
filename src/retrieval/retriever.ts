@@ -19,6 +19,7 @@ import { getReranker } from "../ranking/reranker.js";
 /**
  * Retriever 抽象（§16）：Query Pipeline 只依赖接口，不绑定具体索引实现。
  * documentIds 用于版本过滤：限定只在这些文档的 chunk 内检索。
+ * vector 为预嵌入的查询向量：multi-query 批量路径复用一次 API 请求的结果（§23.2）。
  */
 export interface Retriever {
   retrieve(
@@ -26,6 +27,7 @@ export interface Retriever {
     query: string,
     topK: number,
     documentIds?: string[],
+    vector?: number[],
   ): Promise<RetrievalHit[]>;
 }
 
@@ -43,11 +45,13 @@ export class VectorRetriever implements Retriever {
     query: string,
     topK: number,
     documentIds?: string[],
+    vector?: number[],
   ): Promise<RetrievalHit[]> {
-    // query 向量化；无向量（如空文本）时直接返回空
-    const [vector] = await getEmbedding().embed([query]);
-    if (!vector) return [];
-    const hits = await getVectorStore().search(tenantId, vector, topK, {
+    // query 向量化；无向量（如空文本）时直接返回空。
+    // 传入 vector 时复用调用方批量嵌入的结果，省去本路重复调用 API（§23.2）
+    const v = vector ?? (await getEmbedding().embed([query]))[0];
+    if (!v || v.length === 0) return [];
+    const hits = await getVectorStore().search(tenantId, v, topK, {
       documentIds,
     });
     return hits.map((h) => ({
@@ -99,6 +103,9 @@ export interface Evidence {
   fusionScore?: number;
   rerankScore?: number;
 }
+
+/** 证据数低于该阈值时跳过 LLM 重排：融合分排序已足够可信，省一次 LLM 调用（§23.2） */
+export const RERANK_MIN_EVIDENCE = 4;
 
 /** 回表 parent content + 文档元数据，按 childIds 顺序组装证据片段 */
 async function assembleEvidence(
@@ -159,6 +166,8 @@ export interface RetrieveOptions {
   useReranker?: boolean;
   /** 版本过滤：限定只在这些文档的 chunk 内检索 */
   documentIds?: string[];
+  /** 预嵌入的查询向量：multi-query 批量路径复用一次 API 请求的向量（§23.2） */
+  vector?: number[];
 }
 
 /**
@@ -189,7 +198,13 @@ export async function retrieveEvidence(
 
   // 1. 并行执行两路检索：向量（语义）检索 + 关键词（BM25）检索，各取 topK 条
   const [vectorHits, keywordHits] = await Promise.all([
-    new VectorRetriever().retrieve(tenantId, query, topK, documentIds),
+    new VectorRetriever().retrieve(
+      tenantId,
+      query,
+      topK,
+      documentIds,
+      opts.vector,
+    ),
     new KeywordRetriever().retrieve(tenantId, query, topK, documentIds),
   ]);
 
@@ -234,6 +249,11 @@ export async function retrieveEvidence(
 
   // 关闭重排的降级路径：直接按融合分排序返回
   if (opts.useReranker === false) {
+    return evidence;
+  }
+
+  // 证据过少时跳过重排：2~3 条证据按融合分排序已足够可信，避免多付一次 LLM 调用
+  if (evidence.length < RERANK_MIN_EVIDENCE) {
     return evidence;
   }
 

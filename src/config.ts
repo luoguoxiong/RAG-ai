@@ -58,6 +58,8 @@ export const config = {
     enabled: process.env.QUERY_INTELLIGENCE_ENABLED !== "false",
     multiQueryCount: Number(process.env.MULTI_QUERY_COUNT ?? 3),
   },
+  // 搜索结果缓存 TTL（秒，0 关闭）：键为 (tenantId, topK, intelligence, query) 哈希
+  searchCacheTtlSeconds: Number(process.env.SEARCH_CACHE_TTL ?? 600),
   // Evaluation（§22）：指标回退容忍度，低于基线×(1-tolerance) 视为回归（CI gate）
   evalBaselineTolerance: Number(process.env.EVAL_BASELINE_TOLERANCE ?? 0.1),
 };

@@ -1,6 +1,12 @@
 import { config } from "../config.js";
-import { retrieveEvidence, type Evidence } from "../retrieval/retriever.js";
+import {
+  retrieveEvidence,
+  RERANK_MIN_EVIDENCE,
+  type Evidence,
+} from "../retrieval/retriever.js";
+import { getEmbedding } from "../indexing/vector.js";
 import { reciprocalRankFusion } from "../ranking/rrf.js";
+import { getReranker } from "../ranking/reranker.js";
 import { analyzeQuery, type QueryAnalysis } from "./analyzer.js";
 import { routeQuery, type RetrievalPlan } from "./router.js";
 import { createQueryRewriter } from "./rewrite.js";
@@ -23,17 +29,26 @@ export interface QueryIntelligenceResult {
   evidence: Evidence[];
 }
 
-/** 多查询检索：每条变体独立混合检索，按 RRF 融合去重（§10） */
+/** 多查询检索：每条变体独立混合检索（仅召回不重排），RRF 融合后统一重排一次（§10） */
 async function retrieveEvidenceMulti(
   tenantId: string,
+  query: string,
   queries: string[],
   topK: number,
   useReranker: boolean,
   documentIds?: string[],
 ): Promise<Evidence[]> {
+  // 各变体只按融合分召回（useReranker=false 跳过每路 LLM 重排，省 N-1 次调用），
+  // 重排统一放在 RRF 融合之后做一次；
+  // 向量批量嵌入：所有变体合并为一次 API 请求（§23.2），避免 N 路重复调用 embedding
+  const vectors = await getEmbedding().embed(queries);
   const results = await Promise.all(
-    queries.map((q) =>
-      retrieveEvidence(tenantId, q, topK, { useReranker, documentIds }),
+    queries.map((q, i) =>
+      retrieveEvidence(tenantId, q, topK, {
+        useReranker: false,
+        documentIds,
+        vector: vectors[i],
+      }),
     ),
   );
   const rankLists = results.map((evs) =>
@@ -60,6 +75,26 @@ async function retrieveEvidenceMulti(
       source: "hybrid",
     });
   }
+
+  // 融合后统一重排一次：各变体检索阶段已跳过重排，故全程只付一次 LLM 调用
+  if (useReranker && ordered.length >= RERANK_MIN_EVIDENCE) {
+    const reranked = await getReranker().rerank(
+      query,
+      ordered.map((e) => ({ id: e.chunkId, content: e.content, score: e.score })),
+    );
+    const byChunk = new Map(ordered.map((e) => [e.chunkId, e]));
+    const reordered: Evidence[] = [];
+    for (const r of reranked) {
+      const e = byChunk.get(r.id);
+      if (!e) continue;
+      e.rerankScore = r.score;
+      e.score = r.score;
+      e.id = `ev_${reordered.length + 1}`;
+      reordered.push(e);
+    }
+    return reordered;
+  }
+
   return ordered;
 }
 
@@ -123,6 +158,7 @@ export async function transformAndRetrieve(
       effectiveQueries: effective,
       evidence: await retrieveEvidenceMulti(
         tenantId,
+        query,
         effective,
         topK,
         useReranker,

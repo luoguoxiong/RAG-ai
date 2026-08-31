@@ -6,6 +6,10 @@ import {
   type QueryIntelligenceResult,
 } from "../query/index.js";
 import { evaluateRetrieval, type RetrievalMetrics } from "../evaluation/metrics.js";
+import {
+  getCachedSearch,
+  setCachedSearch,
+} from "../cache/search.js";
 
 export interface Citation {
   /** 引用编号，从 1 开始，与回答正文中的 [n] 一一对应 */
@@ -41,6 +45,17 @@ export interface SearchResult {
   latencyMs?: number;
   /** 检索质量指标（Recall@K / Hit Rate / MRR / NDCG）：仅请求提供了 goldChunkIds 时计算 */
   retrievalMetrics?: RetrievalMetrics;
+  /** 是否命中结果缓存（§23.2）：命中时 retrievalMs/generationMs 为 0 */
+  cached?: boolean;
+}
+
+/** 单条证据送入 LLM 的正文长度上限（字符）：截断过长 chunk，控制生成成本与延迟 */
+const MAX_EVIDENCE_CHARS = 1500;
+/** 全部证据拼入上下文的总长度上限（字符）：超过后按相关度顺序丢弃尾部证据 */
+const MAX_CONTEXT_CHARS = 8000;
+
+function truncate(text: string, max: number): string {
+  return text.length <= max ? text : `${text.slice(0, max)}…`;
 }
 
 /** Context Builder（§20）：把 Evidence 序列化为带引用编号的提示词上下文。 */
@@ -51,15 +66,26 @@ export function buildMessages(query: string, evidence: Evidence[]): ChatMessage[
     "回答时用 [1]、[2] 等编号引用对应证据。",
   ].join("\n");
 
-  const blocks = evidence
-    .map(
-      (e, i) =>
-        `[Evidence: ev_${i + 1}]\n标题：${e.title || "（无标题）"}\n内容：${e.content}`,
-    )
-    .join("\n\n");
+  // 证据已按相关度排序：预算内逐条拼入，超预算的尾部证据丢弃（LLM 自然不会引用）
+  const blocks: string[] = [];
+  let used = 0;
+  for (const e of evidence) {
+    const header = `[Evidence: ev_${blocks.length + 1}]\n标题：${e.title || "（无标题）"}\n内容：`;
+    const content = truncate(e.content, MAX_EVIDENCE_CHARS);
+    const remaining = MAX_CONTEXT_CHARS - used;
+    if (header.length + content.length > remaining) {
+      if (remaining > header.length) {
+        blocks.push(`${header}${truncate(content, remaining - header.length)}`);
+      }
+      break;
+    }
+    blocks.push(`${header}${content}`);
+    used += header.length + content.length + 2;
+  }
+  const blocksText = blocks.join("\n\n");
 
-  const user = evidence.length
-    ? `【证据】\n${blocks}\n\n【问题】\n${query}`
+  const user = blocks.length
+    ? `【证据】\n${blocksText}\n\n【问题】\n${query}`
     : `【问题】\n${query}`;
 
   return [
@@ -73,7 +99,10 @@ export async function generateAnswer(
   query: string,
   evidence: Evidence[],
 ): Promise<string> {
-  const reply = await createLLMProvider().chat(buildMessages(query, evidence));
+  const reply = await createLLMProvider().chat(buildMessages(query, evidence), {
+    // 限制输出长度：防止模型生成长文拖慢响应，回答通常不超过 1024 token
+    maxTokens: 1024,
+  });
   return reply.content;
 }
 
@@ -98,8 +127,27 @@ export async function answerQuery(
   const k = topK ?? config.defaultTopK;
   const enabled = config.queryIntelligence.enabled && (opts?.intelligence ?? true);
   const documentIds = opts?.documentIds;
+  // 带 ground truth 的评估请求不读/不写缓存，保证指标语义（缓存条目不携带指标）
+  const useCache = !opts?.goldChunkIds || opts.goldChunkIds.length === 0;
 
   const totalStart = Date.now();
+
+  // 缓存读：命中直接返回回答与引用，跳过检索与生成（§23.2）
+  if (useCache) {
+    const cached = await getCachedSearch(tenantId, query, k, enabled);
+    if (cached) {
+      return {
+        query,
+        answer: cached.answer,
+        citations: cached.citations,
+        evidenceCount: cached.evidenceCount,
+        retrievalMs: 0,
+        generationMs: 0,
+        latencyMs: Date.now() - totalStart,
+        cached: true,
+      };
+    }
+  }
 
   let evidence: Evidence[];
   let qi: QueryIntelligenceResult | undefined;
@@ -139,6 +187,15 @@ export async function answerQuery(
           k,
         )
       : undefined;
+
+  // 缓存写：评估请求（带 goldChunkIds）不缓存
+  if (useCache) {
+    await setCachedSearch(tenantId, query, k, enabled, {
+      answer,
+      citations,
+      evidenceCount: evidence.length,
+    });
+  }
 
   return {
     query,
