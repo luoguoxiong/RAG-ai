@@ -1,13 +1,17 @@
 import { NavLink, Route, Routes } from "react-router-dom";
-import { Bot, FileText } from "lucide-react";
+import { Bot, FileText, FlaskConical, History } from "lucide-react";
 import { cn } from "./lib/utils";
 import { TenantSwitcher } from "./components/TenantSwitcher";
 import ChatPage from "./features/chat/ChatPage";
 import DocumentsPage from "./features/documents/DocumentsPage";
+import EvalPage from "./features/eval/EvalPage";
+import HistoryPage from "./features/history/HistoryPage";
 
 const nav = [
   { to: "/", label: "检索问答", icon: Bot, end: true },
   { to: "/documents", label: "知识库", icon: FileText, end: false },
+  { to: "/history", label: "检索历史", icon: History, end: false },
+  { to: "/eval", label: "评估", icon: FlaskConical, end: false },
 ];
 
 export default function App() {
@@ -42,6 +46,8 @@ export default function App() {
         <Routes>
           <Route path="/" element={<ChatPage />} />
           <Route path="/documents" element={<DocumentsPage />} />
+          <Route path="/history" element={<HistoryPage />} />
+          <Route path="/eval" element={<EvalPage />} />
         </Routes>
       </main>
     </div>

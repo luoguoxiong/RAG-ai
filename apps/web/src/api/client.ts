@@ -1,6 +1,12 @@
 import type {
+  CreateDatasetResponse,
   DocumentDetail,
   DocumentRow,
+  EvalDataset,
+  EvalRun,
+  EvalRunDetail,
+  EvalRunSummary,
+  RetrievalLog,
   SearchResult,
   VersionRow,
 } from "./types";
@@ -87,5 +93,56 @@ export const api = {
     return request<{ ok: boolean }>(`/versions/${id}/activate`, {
       method: "POST",
     });
+  },
+
+  // ── 评估 ──────────────────────────────────────────────
+  listEvalDatasets(): Promise<EvalDataset[]> {
+    return request<EvalDataset[]>("/eval/datasets");
+  },
+  createEvalDataset(body: {
+    name: string;
+    description?: string;
+    indexVersion?: string;
+    embeddingVersion?: string;
+    queries: {
+      query: string;
+      goldChunkIds?: string[];
+      referenceAnswer?: string;
+      keyFacts?: string[];
+    }[];
+  }): Promise<CreateDatasetResponse> {
+    return request<CreateDatasetResponse>("/eval/datasets", {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+  },
+  listEvalRuns(): Promise<EvalRun[]> {
+    return request<EvalRun[]>("/eval/runs");
+  },
+  runEvaluation(body: {
+    datasetId: string;
+    topK?: number;
+  }): Promise<EvalRunSummary> {
+    return request<EvalRunSummary>("/eval/runs", {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+  },
+  getEvalRunDetail(id: string): Promise<EvalRunDetail> {
+    return request<EvalRunDetail>(`/eval/runs/${id}`);
+  },
+  async getEvalReport(id: string): Promise<string> {
+    const res = await fetch(`/eval/runs/${id}/report`, {
+      headers: { "x-tenant-id": getTenantId() },
+    });
+    if (!res.ok) {
+      throw new ApiError(res.status, await res.text().catch(() => ""));
+    }
+    return res.text();
+  },
+
+  // ── 检索历史 ──────────────────────────────────────────
+  listRetrievalLogs(): Promise<RetrievalLog[]> {
+    return request<RetrievalLog[]>("/search/logs");
   },
 };

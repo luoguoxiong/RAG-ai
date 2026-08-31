@@ -32,6 +32,12 @@ export interface SearchResult {
   analysis?: QueryIntelligenceResult["analysis"];
   plan?: QueryIntelligenceResult["plan"];
   effectiveQueries?: string[];
+  /** 检索阶段耗时（毫秒） */
+  retrievalMs?: number;
+  /** 生成阶段耗时（毫秒） */
+  generationMs?: number;
+  /** 总耗时（毫秒） */
+  latencyMs?: number;
 }
 
 /** Context Builder（§20）：把 Evidence 序列化为带引用编号的提示词上下文。 */
@@ -85,8 +91,11 @@ export async function answerQuery(
   const enabled = config.queryIntelligence.enabled && (opts?.intelligence ?? true);
   const documentIds = opts?.documentIds;
 
+  const totalStart = Date.now();
+
   let evidence: Evidence[];
   let qi: QueryIntelligenceResult | undefined;
+  const retrievalStart = Date.now();
   if (enabled) {
     // 智能链路：分析 -> 路由 -> 变换 -> 检索，附带 analysis/plan 供可观测性
     qi = await runQueryIntelligence(tenantId, query, k, documentIds);
@@ -95,9 +104,14 @@ export async function answerQuery(
     // 直连链路：跳过 Query Intelligence，直接混合检索
     evidence = await retrieveEvidence(tenantId, query, k, { documentIds });
   }
+  const retrievalMs = Date.now() - retrievalStart;
 
   // Context Builder -> LLM 生成带 [n] 引用的回答
+  const generationStart = Date.now();
   const answer = await generateAnswer(query, evidence);
+  const generationMs = Date.now() - generationStart;
+
+  const latencyMs = Date.now() - totalStart;
 
   // 按证据顺序生成引用列表，index 与回答正文中的 [n] 一一对应
   const citations: Citation[] = evidence.map((e, i) => ({
@@ -117,5 +131,8 @@ export async function answerQuery(
     analysis: qi?.analysis,
     plan: qi?.plan,
     effectiveQueries: qi?.effectiveQueries,
+    retrievalMs,
+    generationMs,
+    latencyMs,
   };
 }

@@ -12,12 +12,15 @@
  * 可选 versionId 做版本过滤（检索范围限定在该版本文档集内，缺省用激活版本）。
  */
 import type { FastifyInstance } from "fastify";
+import { desc } from "drizzle-orm";
 import { answerQuery } from "../application/query.js";
 import { resolveVersionDocumentIds } from "../application/version.js";
 import { retrieveGraph } from "../retrieval/graph.js";
 import { text2Cypher } from "../retrieval/text2cypher.js";
 import { globalGraphSearch } from "../retrieval/global-graph.js";
 import { analyzeAndRoute } from "../query/index.js";
+import { withTenantTx } from "../db/index.js";
+import { retrievalLogs } from "../db/schema/retrieval-log.js";
 
 /** 从请求头读取租户 ID，缺失或为空直接抛错拒绝 */
 function tenantOf(headers: Record<string, unknown>): string {
@@ -85,10 +88,49 @@ export async function searchRoutes(app: FastifyInstance): Promise<void> {
       typeof req.body?.topK === "number" && req.body.topK > 0
         ? req.body.topK
         : undefined;
-    return answerQuery(tenantId, query, topK, {
-      intelligence: req.body?.intelligence,
+    const intelligence = req.body?.intelligence;
+    const result = await answerQuery(tenantId, query, topK, {
+      intelligence,
       documentIds,
     });
+
+    // 异步写入检索日志（不阻塞响应）
+    const topScore = result.citations.length > 0
+      ? Math.max(...result.citations.map((c) => c.score))
+      : null;
+    withTenantTx(tenantId, (tx) =>
+      tx.insert(retrievalLogs).values({
+        tenantId,
+        query: result.query,
+        topK: topK ?? 6,
+        intelligence: intelligence ?? false,
+        evidenceCount: result.evidenceCount,
+        citationCount: result.citations.length,
+        topScore,
+        effectiveQueries: result.effectiveQueries ?? [],
+        chunkIds: result.citations.map((c) => c.chunkId),
+        retrievalMs: result.retrievalMs,
+        generationMs: result.generationMs,
+        latencyMs: result.latencyMs,
+        answer: result.answer,
+      }),
+    ).catch((err) => {
+      console.error("[search] failed to log retrieval:", err);
+    });
+
+    return result;
+  });
+
+  // 检索历史列表（最近 100 条）
+  app.get("/search/logs", async (req) => {
+    const tenantId = tenantOf(req.headers);
+    return withTenantTx(tenantId, (tx) =>
+      tx
+        .select()
+        .from(retrievalLogs)
+        .orderBy(desc(retrievalLogs.createdAt))
+        .limit(100),
+    );
   });
 
   // Query Intelligence 调试端点（§13-15）：只做分析 + 路由，不检索

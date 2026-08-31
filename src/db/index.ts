@@ -57,7 +57,7 @@ export async function setupRls(): Promise<void> {
     DECLARE t text;
     BEGIN
       -- 逐个处理所有租户相关表（新增表需同步维护此清单）
-      FOREACH t IN ARRAY ARRAY['documents','document_versions','chunks','index_status','jobs','outbox','entities','entity_mentions','relations','communities','community_members','eval_datasets','eval_queries','eval_runs','eval_run_results','dataset_versions']
+      FOREACH t IN ARRAY ARRAY['documents','document_versions','chunks','index_status','jobs','outbox','entities','entity_mentions','relations','communities','community_members','eval_datasets','eval_queries','eval_runs','eval_run_results','dataset_versions','retrieval_logs']
       LOOP
         -- 1. 开启并强制 RLS：即便连接角色是表 owner 也必须走策略，无法绕过
         EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY', t);

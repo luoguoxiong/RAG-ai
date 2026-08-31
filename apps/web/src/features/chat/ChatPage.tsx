@@ -1,5 +1,5 @@
 import { useState, type KeyboardEvent } from "react";
-import { useMutation } from "@tanstack/react-query";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { Loader2, Send } from "lucide-react";
 import { api } from "../../api/client";
 import { Button } from "../../components/ui/button";
@@ -24,12 +24,17 @@ function renderAnswer(answer: string) {
 }
 
 export default function ChatPage() {
+  const qc = useQueryClient();
   const [query, setQuery] = useState("");
   const [topK, setTopK] = useState(6);
   const [intelligence, setIntelligence] = useState(true);
 
   const search = useMutation({
     mutationFn: () => api.search({ query, topK, intelligence }),
+    onSuccess: () => {
+      // 检索落库后刷新历史页缓存
+      qc.invalidateQueries({ queryKey: ["retrieval-logs"] });
+    },
   });
 
   const submit = () => {
