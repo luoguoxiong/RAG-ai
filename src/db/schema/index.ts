@@ -7,3 +7,4 @@ export * from "./job";
 export * from "./outbox";
 export * from "./eval";
 export * from "./retrieval-log";
+export * from "./agent";

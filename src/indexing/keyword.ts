@@ -30,6 +30,10 @@ const MAPPINGS = {
  */
 export class KeywordStore {
   private readonly client: Client;
+  /** 进程内已确认存在的 index：省每次检索的 indices.exists HTTP 往返（§23.2） */
+  private readonly readyIndices = new Set<string>();
+  /** 并发去重：同一 index 的初始化检查同时只发一次请求 */
+  private readonly pendingEnsures = new Map<string, Promise<void>>();
 
   constructor(opts: { url: string }) {
     this.client = new Client({ node: opts.url });
@@ -37,12 +41,22 @@ export class KeywordStore {
 
   async ensureIndex(tenantId: string): Promise<void> {
     const name = indexName(tenantId);
-    const exists = await this.client.indices.exists({ index: name });
-    if (exists.body) return;
-    await this.client.indices.create({
-      index: name,
-      body: { mappings: MAPPINGS },
-    });
+    if (this.readyIndices.has(name)) return;
+    const inflight = this.pendingEnsures.get(name);
+    if (inflight) return inflight;
+    const task = (async () => {
+      const exists = await this.client.indices.exists({ index: name });
+      if (!exists.body) {
+        await this.client.indices.create({
+          index: name,
+          body: { mappings: MAPPINGS },
+        });
+      }
+      // 成功后才标记：失败留给下次调用重试
+      this.readyIndices.add(name);
+    })().finally(() => this.pendingEnsures.delete(name));
+    this.pendingEnsures.set(name, task);
+    return task;
   }
 
   async upsert(

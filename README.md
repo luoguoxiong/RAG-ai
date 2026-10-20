@@ -17,6 +17,7 @@
 - **进阶 GraphRAG**：Text2Cypher（自然语言→Cypher）、社区检测、社区摘要全局检索
 - **引用生成**：带 `[1][2]` 编号的引用回链到具体 chunk
 - **评估体系**：Eval Dataset（ground truth）+ Retrieve/Generate 指标 + 回归报告（CI gate）
+- **自优化 Agent**：线上 Badcase 分阶段错误分析（错在检索/排序/上下文/生成/性能哪一步）+ 评估集整体测评（综合评分 / 分维度质量评估 / 问题清单）+ 参数自动调优（实验计划 → 离线评测 → 硬约束门禁 → 优化前后对比报告）
 - **一致性骨架**：Outbox 事件 + Reconciliation 对账循环，派生索引可自愈重建
 
 ## 技术栈
@@ -168,6 +169,18 @@ curl -X POST http://localhost:3000/search \
 | GET | `/eval/runs` | 评估运行记录列表 |
 | GET | `/eval/runs/:id` | 运行详情（逐查询结果） |
 | GET | `/eval/runs/:id/report` | 回归报告（Markdown） |
+| POST | `/agent/diagnosis` | 运行 Badcase 错误分析：规则分阶段定位 + LLM 复核，输出分析报告 |
+| GET | `/agent/diagnosis` | 诊断任务列表 |
+| GET | `/agent/diagnosis/:id` | 诊断详情（样本级「错在哪一步」结论） |
+| GET | `/agent/diagnosis/:id/report` | 分析报告（Markdown） |
+| POST | `/agent/tuning` | 运行参数自动调优：实验计划 → 离线评测 → 硬约束门禁 → 优化前后对比 |
+| GET | `/agent/tuning` | 调优任务列表 |
+| GET | `/agent/tuning/:id` | 调优详情（实验记录 + 前后对比） |
+| GET | `/agent/tuning/:id/report` | 调优报告（Markdown） |
+| POST | `/agent/assessment` | 评估集整体测评：完整评测 → 综合评分（A/B/C/D）+ 分维度质量评估 + 问题清单 |
+| GET | `/agent/assessment` | 测评任务列表 |
+| GET | `/agent/assessment/:id` | 测评详情（维度得分 / 薄弱查询 / 问题分布） |
+| GET | `/agent/assessment/:id/report` | 测评报告（Markdown） |
 | GET | `/health` | 健康检查 |
 
 ## 配置项
@@ -188,6 +201,10 @@ curl -X POST http://localhost:3000/search \
 | `DEFAULT_TOP_K` / `DEFAULT_MAX_HOPS` | `6` / `2` | 检索默认参数 |
 | `RETRIEVER_TIMEOUT_MS` | `3000` | 单 Retriever 超时 |
 | `EVAL_BASELINE_TOLERANCE` | `0.1` | 回归容忍度（CI gate） |
+| `AGENT_DIAGNOSIS_SINCE_DAYS` / `AGENT_DIAGNOSIS_SAMPLE_LIMIT` | `7` / `200` | Agent 诊断回看窗口与样本上限 |
+| `AGENT_WEAK_EVIDENCE_SCORE` / `AGENT_MIN_RECALL` / `AGENT_MIN_NDCG` | `0.35` / `0.75` / `0.6` | Badcase 判定阈值（示例值，按业务基线调整） |
+| `AGENT_MIN_FAITHFULNESS` / `AGENT_MIN_ANSWER_RELEVANCE` | `0.8` / `0.7` | 整体测评样本级达标线（忠实度 / 相关性） |
+| `AGENT_MAX_EXPERIMENTS` | `6` | 单轮调优实验预算 |
 
 ## npm 脚本
 
@@ -198,6 +215,9 @@ curl -X POST http://localhost:3000/search \
 | `pnpm worker` | 启动后台 Worker（消费队列 + 定时对账） |
 | `pnpm reconcile` | 手动跑一轮 Reconciliation 对账 |
 | `pnpm eval:run` | 运行评估 |
+| `pnpm agent:diagnose` | 运行 Badcase 错误分析（`--days 7 --limit 200 --no-llm`） |
+| `pnpm agent:tune` | 运行参数自动调优（`--dataset <id> --max-experiments 6 --primary recallAtK`） |
+| `pnpm agent:assess` | 评估集整体测评（`--dataset <id> [--topK 6]` 或 `--run <evalRunId>` 复用历史评测） |
 | `pnpm build` | TypeScript 编译 |
 | `pnpm db:generate` | 生成 Drizzle 迁移 |
 | `pnpm db:migrate` | 执行迁移 |
@@ -211,9 +231,11 @@ src/
 ├── worker.ts             # 后台 Worker（队列消费 + 对账循环）
 ├── reconcile.ts          # 手动对账入口
 ├── eval-run.ts           # 评估运行入口
+├── agent-run.ts          # 自优化 Agent CLI（diagnose / tune）
 ├── config.ts             # 统一配置（环境变量映射）
-├── api/                  # HTTP 路由（documents / search / versions / eval）
+├── api/                  # HTTP 路由（documents / search / versions / eval / agent）
 ├── application/          # 应用层（用例编排：ingestion / query / job / reconcile / outbox / version）
+├── agent/                # RAG 自优化 Agent（badcase 诊断 / 参数空间 / 调优编排 / 报告）
 ├── domain/               # 领域层（实体解析等核心领域逻辑）
 ├── ingestion/            # 摄入管线（parser / normalizer / splitter / parent-child / graph 抽取）
 ├── indexing/             # 派生索引写入（vector / keyword / graph / community）

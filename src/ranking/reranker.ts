@@ -98,17 +98,27 @@ export class LLMReranker implements Reranker {
       numbered,
     ].join("\n");
 
-    const reply = await this.llm.chat(
-      [{ role: "user", content: prompt }],
-      { temperature: 0 },
-    );
-    const order = parseIndices(reply.content, items.length) ??
-      items.map((_, i) => i);
+    try {
+      const reply = await this.llm.chat(
+        [{ role: "user", content: prompt }],
+        { temperature: 0 },
+      );
+      const order = parseIndices(reply.content, items.length) ??
+        items.map((_, i) => i);
 
-    return order.map((idx, rank) => {
-      const it = items[idx];
-      return { id: it?.id ?? "", score: it ? 1 - rank / items.length : 0 };
-    });
+      return order.map((idx, rank) => {
+        const it = items[idx];
+        return { id: it?.id ?? "", score: it ? 1 - rank / items.length : 0 };
+      });
+    } catch (err) {
+      // LLM 超时/不可用/输出异常 → 降级为确定性词面重排，不阻塞检索主链路（§23.1）
+      console.warn(
+        `[reranker] LLM 重排失败，降级为 Lexical 重排: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+      return new LexicalReranker().rerank(query, items);
+    }
   }
 }
 

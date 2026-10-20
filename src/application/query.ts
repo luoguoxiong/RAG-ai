@@ -133,8 +133,9 @@ export async function answerQuery(
   const totalStart = Date.now();
 
   // 缓存读：命中直接返回回答与引用，跳过检索与生成（§23.2）
+  // documentIds（版本展开范围）参与缓存键，避免跨版本命中旧答案
   if (useCache) {
-    const cached = await getCachedSearch(tenantId, query, k, enabled);
+    const cached = await getCachedSearch(tenantId, query, k, enabled, documentIds);
     if (cached) {
       return {
         query,
@@ -194,7 +195,7 @@ export async function answerQuery(
       answer,
       citations,
       evidenceCount: evidence.length,
-    });
+    }, documentIds);
   }
 
   return {

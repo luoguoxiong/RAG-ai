@@ -1,5 +1,3 @@
-import { config } from "../config.js";
-import { createLLMProvider, type LLMProvider } from "../ai/llm.js";
 import { DeterministicEntityExtractor } from "../ingestion/graph/extractor.js";
 
 /**
@@ -145,7 +143,8 @@ const INTENTS: QueryIntent[] = [
 const COMPLEXITIES: QueryComplexity[] = ["simple", "medium", "complex"];
 const SOURCES: RetrievalSource[] = ["vector", "keyword", "graph", "sql"];
 
-function normalizeLlmAnalysis(raw: unknown): QueryAnalysis | null {
+/** LLM 分析结果归一化：非法字段回退默认值（router 合并路径复用） */
+export function normalizeLlmAnalysis(raw: unknown): QueryAnalysis | null {
   if (!raw || typeof raw !== "object") return null;
   const o = raw as Record<string, unknown>;
   if (typeof o.intent !== "string") return null;
@@ -205,39 +204,7 @@ export class RuleQueryAnalyzer implements QueryAnalyzer {
   }
 }
 
-/** LLM 分析器：低置信度时的升级路径，失败回退到规则结果 */
-export class LLMQueryAnalyzer implements QueryAnalyzer {
-  constructor(
-    private readonly llm: LLMProvider,
-    private readonly fallback: QueryAnalyzer,
-  ) {}
-
-  async analyze(query: string): Promise<QueryAnalysis> {
-    const prompt = [
-      "你是查询分析器。分析下面检索问题的意图、实体、复杂度与是否需要变换。",
-      "只输出 JSON，不要输出其它文字：",
-      '{"intent":"fact|relationship|multi_hop|aggregation|comparison|code|unknown",',
-      '"entities":["实体名"],"complexity":"simple|medium|complex",',
-      '"needsRewrite":false,"needsMultiQuery":false,"needsHyDE":false,',
-      '"suggestedSources":["vector","keyword","graph"]}',
-      "",
-      `问题：${query}`,
-    ].join("\n");
-    try {
-      const reply = await this.llm.chat(
-        [{ role: "user", content: prompt }],
-        { temperature: 0 },
-      );
-      const parsed = normalizeLlmAnalysis(extractJsonObject(reply.content));
-      if (parsed) return parsed;
-    } catch {
-      // LLM 不可用或解析失败 → 回退
-    }
-    return this.fallback.analyze(query);
-  }
-}
-
-/** 低置信度判定：未知意图 + 无实体 + 无变换信号时升级到 LLM 分析 */
+/** 低置信度判定：未知意图 + 无实体 + 无变换信号时升级到 LLM（分析与路由合并为一次调用） */
 export function isLowConfidence(a: QueryAnalysis): boolean {
   return (
     a.intent === "unknown" &&
@@ -246,19 +213,4 @@ export function isLowConfidence(a: QueryAnalysis): boolean {
     !a.needsMultiQuery &&
     !a.needsHyDE
   );
-}
-
-/** Query Analyzer 入口：规则优先，低置信且配置了 API key 时用 LLM 精化 */
-export async function analyzeQuery(query: string): Promise<QueryAnalysis> {
-  const rule = new RuleQueryAnalyzer();
-  const analysis = await rule.analyze(query);
-  if (config.openai.apiKey && isLowConfidence(analysis)) {
-    const refined = await new LLMQueryAnalyzer(createLLMProvider(), rule).analyze(query);
-    return {
-      ...refined,
-      // 规则侧派生实体可能比 LLM 更稳（确定性），做合并兜底
-      entities: refined.entities.length ? refined.entities : analysis.entities,
-    };
-  }
-  return analysis;
 }

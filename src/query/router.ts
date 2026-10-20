@@ -1,16 +1,19 @@
 import { config } from "../config.js";
 import { createLLMProvider, type LLMProvider } from "../ai/llm.js";
 import {
+  RuleQueryAnalyzer,
   extractJsonObject,
   isLowConfidence,
+  normalizeLlmAnalysis,
   type QueryAnalysis,
   type RetrievalSource,
 } from "./analyzer.js";
 
 /**
  * Query Router（§15，Phase 5 Query Intelligence）：
- * Rule Router 高置信 → 直连；低置信（unknown）→ LLM Router。
- * 不要所有请求都调用 LLM Router（cheap-first，§23.2）。
+ * Rule Router 高置信 → 直连；低置信（unknown）→ 一次 LLM 同时产出 analysis + plan。
+ * 原实现是 Analyzer 与 Router 两次串行 LLM（最坏 2 次往返），
+ * 合并后低置信路径也只付一次 LLM 调用（cheap-first，§23.2）。
  */
 
 export interface RetrievalPlan {
@@ -81,54 +84,78 @@ function normalizeLlmPlan(raw: unknown, topK: number): RetrievalPlan | null {
   };
 }
 
-/** LLM Router：只处理 Rule Router 无法高置信判定的查询，失败回退到规则 */
-export class LLMRouter implements QueryRouter {
-  constructor(
-    private readonly llm: LLMProvider,
-    private readonly fallback: QueryRouter,
-  ) {}
-
-  async route(
-    query: string,
-    analysis: QueryAnalysis,
-    topK?: number,
-  ): Promise<RetrievalPlan> {
-    const k = topK ?? config.defaultTopK;
-    const prompt = [
-      "你是检索路由。根据问题的含义决定使用哪些检索来源与策略。",
-      "只输出 JSON，不要输出其它文字：",
-      '{"sources":["vector","keyword","graph"],"parallel":true,"useReranker":true}',
-      "规则：事实/语义问题用 vector+keyword；涉及实体关系或多跳用 graph；聚合统计用 sql。",
-      "",
-      `问题：${query}`,
-      `规则分析：${JSON.stringify(analysis)}`,
-    ].join("\n");
-    try {
-      const reply = await this.llm.chat(
-        [{ role: "user", content: prompt }],
-        { temperature: 0 },
-      );
-      const plan = normalizeLlmPlan(extractJsonObject(reply.content), k);
-      if (plan) return plan;
-    } catch {
-      // LLM 不可用或解析失败 → 回退
-    }
-    return this.fallback.route(query, analysis, k);
+/**
+ * 一次 LLM 同时产出分析 + 路由（§13-15 低置信升级路径，§23.2）。
+ * 任一部分解析失败 / LLM 异常 → 返回 null，由调用方整体回退规则结果，
+ * 不再像旧实现那样「Analyzer 失败后再试 Router」多付一次串行往返。
+ */
+async function llmAnalyzeAndRoute(
+  llm: LLMProvider,
+  query: string,
+  ruleAnalysis: QueryAnalysis,
+  topK: number,
+): Promise<{ analysis: QueryAnalysis; plan: RetrievalPlan } | null> {
+  const prompt = [
+    "你是检索规划器。先分析问题，再决定使用哪些检索来源与策略。",
+    "只输出 JSON，不要输出其它文字：",
+    '{"analysis":{"intent":"fact|relationship|multi_hop|aggregation|comparison|code|unknown",',
+    '"entities":["实体名"],"complexity":"simple|medium|complex",',
+    '"needsRewrite":false,"needsMultiQuery":false,"needsHyDE":false,',
+    '"suggestedSources":["vector","keyword","graph"]},',
+    '"plan":{"sources":["vector","keyword","graph"],"parallel":true,"useReranker":true}}',
+    "规则：事实/语义问题用 vector+keyword；涉及实体关系或多跳用 graph；聚合统计用 sql。",
+    "",
+    `问题：${query}`,
+    `规则分析：${JSON.stringify(ruleAnalysis)}`,
+  ].join("\n");
+  try {
+    const reply = await llm.chat(
+      [{ role: "user", content: prompt }],
+      { temperature: 0 },
+    );
+    const raw = extractJsonObject(reply.content);
+    if (!raw || typeof raw !== "object") return null;
+    const o = raw as Record<string, unknown>;
+    const analysis = normalizeLlmAnalysis(o.analysis);
+    const plan = normalizeLlmPlan(o.plan, topK);
+    if (!analysis && !plan) return null;
+    return {
+      analysis: analysis ?? ruleAnalysis,
+      plan: plan ?? buildPlan(analysis ?? ruleAnalysis, topK, "llm"),
+    };
+  } catch {
+    // LLM 不可用或解析失败 → 回退规则
+    return null;
   }
 }
 
-/** Router 入口：Rule Router 高置信直连，低置信且有 API key 时走 LLM Router */
-export async function routeQuery(
+/**
+ * 分析 + 路由入口（§13-15）：
+ * 规则高置信 → 直连规则路由，零 LLM；
+ * 低置信且有 API key → 一次 LLM 调用同时产出 analysis + plan（省一次串行往返）；
+ * LLM 失败/解析非法 → 规则分析与规则路由兜底。
+ */
+export async function analyzeAndPlan(
   query: string,
-  analysis: QueryAnalysis,
   topK?: number,
-): Promise<RetrievalPlan> {
-  if (config.openai.apiKey && isLowConfidence(analysis)) {
-    return new LLMRouter(createLLMProvider(), new RuleRouter()).route(
-      query,
-      analysis,
-      topK,
-    );
+): Promise<{ analysis: QueryAnalysis; plan: RetrievalPlan }> {
+  const k = topK ?? config.defaultTopK;
+  const ruleAnalyzer = new RuleQueryAnalyzer();
+  const analysis = await ruleAnalyzer.analyze(query);
+  const rulePlan = buildPlan(analysis, k, "rule");
+  if (!(config.openai.apiKey && isLowConfidence(analysis))) {
+    return { analysis, plan: rulePlan };
   }
-  return new RuleRouter().route(query, analysis, topK);
+  const merged = await llmAnalyzeAndRoute(
+    createLLMProvider(),
+    query,
+    analysis,
+    k,
+  );
+  if (!merged) return { analysis, plan: rulePlan };
+  // 规则侧派生实体可能比 LLM 更稳（确定性），做合并兜底
+  if (merged.analysis.entities.length === 0 && analysis.entities.length > 0) {
+    merged.analysis = { ...merged.analysis, entities: analysis.entities };
+  }
+  return merged;
 }

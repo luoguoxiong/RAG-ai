@@ -22,6 +22,10 @@ export interface VectorHit {
 export class VectorStore {
   private readonly client: QdrantClient;
   private readonly dims: number;
+  /** 进程内已确认存在的 collection：省每次检索的 collectionExists HTTP 往返（§23.2） */
+  private readonly readyCollections = new Set<string>();
+  /** 并发去重：同一 collection 的初始化检查同时只发一次请求 */
+  private readonly pendingEnsures = new Map<string, Promise<void>>();
 
   constructor(opts: { url: string; apiKey?: string; dims: number }) {
     this.client = new QdrantClient({
@@ -34,11 +38,21 @@ export class VectorStore {
 
   async ensureCollection(tenantId: string): Promise<void> {
     const name = collectionName(tenantId);
-    const exists = await this.client.collectionExists(name);
-    if (exists.exists) return;
-    await this.client.createCollection(name, {
-      vectors: { size: this.dims, distance: "Cosine" },
-    });
+    if (this.readyCollections.has(name)) return;
+    const inflight = this.pendingEnsures.get(name);
+    if (inflight) return inflight;
+    const task = (async () => {
+      const exists = await this.client.collectionExists(name);
+      if (!exists.exists) {
+        await this.client.createCollection(name, {
+          vectors: { size: this.dims, distance: "Cosine" },
+        });
+      }
+      // 成功后才标记：失败留给下次调用重试
+      this.readyCollections.add(name);
+    })().finally(() => this.pendingEnsures.delete(name));
+    this.pendingEnsures.set(name, task);
+    return task;
   }
 
   async upsert(tenantId: string, points: VectorPoint[]): Promise<void> {

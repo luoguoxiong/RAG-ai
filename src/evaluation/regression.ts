@@ -41,7 +41,7 @@ export function checkRegression(
   };
 }
 
-const METRIC_LABELS: Record<keyof EvalMetrics, string> = {
+export const METRIC_LABELS: Record<keyof EvalMetrics, string> = {
   recallAtK: "Recall@K",
   hitRate: "Hit Rate",
   mrr: "MRR",

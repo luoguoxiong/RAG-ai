@@ -9,6 +9,7 @@ import { documentRoutes } from "./api/documents.js";
 import { searchRoutes } from "./api/search.js";
 import { versionRoutes } from "./api/versions.js";
 import { evalRoutes } from "./api/eval.js";
+import { agentRoutes } from "./api/agent.js";
 
 const DEMO_TENANT_ID = "00000000-0000-0000-0000-000000000001";
 
@@ -56,6 +57,7 @@ async function startup(): Promise<void> {
   await app.register(versionRoutes);
   await app.register(searchRoutes);
   await app.register(evalRoutes);
+  await app.register(agentRoutes);
 
   app.get("/health", async () => ({ ok: true }));
 

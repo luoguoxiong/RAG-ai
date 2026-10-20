@@ -62,4 +62,28 @@ export const config = {
   searchCacheTtlSeconds: Number(process.env.SEARCH_CACHE_TTL ?? 600),
   // Evaluation（§22）：指标回退容忍度，低于基线×(1-tolerance) 视为回归（CI gate）
   evalBaselineTolerance: Number(process.env.EVAL_BASELINE_TOLERANCE ?? 0.1),
+  // RAG 自优化与问题分析 Agent（Badcase 诊断 + 参数自动调优）
+  agent: {
+    // 诊断默认回看窗口（天）
+    diagnosisSinceDays: Number(process.env.AGENT_DIAGNOSIS_SINCE_DAYS ?? 7),
+    // 诊断默认最大样本数（线上检索日志条数上限）
+    diagnosisSampleLimit: Number(process.env.AGENT_DIAGNOSIS_SAMPLE_LIMIT ?? 200),
+    // LLM 复核的最大样本数（控制成本与耗时）
+    diagnosisLLMReviewLimit: Number(
+      process.env.AGENT_DIAGNOSIS_LLM_REVIEW_LIMIT ?? 20,
+    ),
+    // badcase 判定阈值（示例值，应结合业务基线与 SLA 调整）
+    weakEvidenceScore: Number(process.env.AGENT_WEAK_EVIDENCE_SCORE ?? 0.35),
+    minRecallAtK: Number(process.env.AGENT_MIN_RECALL ?? 0.75),
+    minNdcg: Number(process.env.AGENT_MIN_NDCG ?? 0.6),
+    // 评估集整体测评的样本级阈值（答案忠实度 / 相关性达标线）
+    minFaithfulness: Number(process.env.AGENT_MIN_FAITHFULNESS ?? 0.8),
+    minAnswerRelevance: Number(
+      process.env.AGENT_MIN_ANSWER_RELEVANCE ?? 0.7,
+    ),
+    slowRetrievalMs: Number(process.env.AGENT_SLOW_RETRIEVAL_MS ?? 3000),
+    slowGenerationMs: Number(process.env.AGENT_SLOW_GENERATION_MS ?? 5000),
+    // 调优预算：单轮最多实验数（每个实验 = 一次固定评测集离线评估）
+    maxExperiments: Number(process.env.AGENT_MAX_EXPERIMENTS ?? 6),
+  },
 };

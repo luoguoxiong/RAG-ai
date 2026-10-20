@@ -10,6 +10,7 @@ import {
 } from "../db/schema/eval.js";
 import { generateAnswer } from "../application/query.js";
 import { retrieveEvidence } from "../retrieval/retriever.js";
+import { runQueryIntelligence } from "../query/index.js";
 import {
   averageMetrics,
   contextPrecision,
@@ -28,6 +29,12 @@ import { checkRegression, renderReport } from "./regression.js";
 export interface EvalRunOptions {
   topK?: number;
   baselineTolerance?: number;
+  /** 关闭 Reranker 重排（自优化 Agent 调参用）；缺省保持默认开启 */
+  rerankerEnabled?: boolean;
+  /** 走 Query Intelligence 链路（Rewrite / Multi Query / HyDE）；缺省关闭，保持既有评估语义 */
+  intelligence?: boolean;
+  /** Multi Query 变体数（intelligence 开启时生效，缺省用全局配置） */
+  multiQueryCount?: number;
 }
 
 export interface EvalRunSummary {
@@ -86,7 +93,12 @@ export async function runEvaluation(
         embeddingModel: config.embedding.model,
         topK,
         llmModel: config.openai.apiKey ? config.openai.model : null,
-        reranker: config.openai.apiKey ? "llm" : "lexical",
+        reranker:
+          opts.rerankerEnabled === false
+            ? "off"
+            : config.openai.apiKey
+              ? "llm"
+              : "lexical",
         status: "running",
       })
       .returning(),
@@ -98,7 +110,18 @@ export async function runEvaluation(
 
   try {
     for (const q of queries) {
-      const evidence = await retrieveEvidence(tenantId, q.query, topK);
+      // 检索链路：默认直连混合检索（与既有评估语义一致）；
+      // opts.intelligence=true 时走 Query Intelligence（Rewrite / Multi Query / HyDE），
+      // 供自优化 Agent 评估查询改写类参数
+      const evidence = opts.intelligence
+        ? (
+            await runQueryIntelligence(tenantId, q.query, topK, undefined, {
+              multiQueryCount: opts.multiQueryCount,
+            })
+          ).evidence
+        : await retrieveEvidence(tenantId, q.query, topK, {
+            useReranker: opts.rerankerEnabled,
+          });
       const retrieved = evidence.map((e) => e.chunkId);
       const retMetrics = evaluateRetrieval(q.goldChunkIds, retrieved, topK);
       const answer = await generateAnswer(q.query, evidence);

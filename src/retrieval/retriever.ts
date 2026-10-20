@@ -9,6 +9,7 @@
  * 版本过滤在回表阶段兜底（assembleEvidence 内二次校验）。
  */
 import { inArray } from "drizzle-orm";
+import { config } from "../config.js";
 import { withTenantTx } from "../db/index.js";
 import { chunks, type ChunkRow } from "../db/schema/chunk.js";
 import { getEmbedding, getVectorStore } from "../indexing/vector.js";
@@ -107,8 +108,109 @@ export interface Evidence {
 /** 证据数低于该阈值时跳过 LLM 重排：融合分排序已足够可信，省一次 LLM 调用（§23.2） */
 export const RERANK_MIN_EVIDENCE = 4;
 
+/**
+ * 竞速超时（§23.1，落地 RetrievalPlan.timeout）：到点未完成则返回 onTimeout 的降级值，
+ * 真正的基础设施错误照常抛出（不掩盖故障，只解决"无限等待"）。
+ * 注意：仅"停止等待"，底层 HTTP 请求不会被中断，避免引入 AbortController 级联复杂度。
+ */
+function raceTimeout<T>(
+  p: Promise<T>,
+  ms: number,
+  onTimeout: () => T,
+  label: string,
+): Promise<T> {
+  if (ms <= 0) return p;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<T>((resolve) => {
+    timer = setTimeout(() => {
+      console.warn(`[retriever] ${label} 超过 ${ms}ms 未返回，降级为空结果`);
+      resolve(onTimeout());
+    }, ms);
+  });
+  // 竞速已由超时胜出后，原 promise 的失败不再有人接：提前挂接空 catch 避免 unhandled rejection
+  p.catch(() => {});
+  return Promise.race([p, timeout]).finally(() => clearTimeout(timer));
+}
+
+/** 召回段结果：融合排序的 chunkId 与各路得分/来源标注，回表由调用方决定时机 */
+export interface HybridRecall {
+  /** 融合后的 chunkId（按融合分降序，已截取 topK） */
+  ids: string[];
+  vectorScore: Map<string, number>;
+  keywordScore: Map<string, number>;
+  fusionScore: Map<string, number>;
+  sourceById: Map<string, "vector" | "keyword" | "hybrid">;
+}
+
+/**
+ * 召回段（§10 前半）：Vector + Keyword 并行检索（各路受超时降级约束，§23.1）
+ * → RRF 融合取 topK。不回表：回表时机由调用方决定
+ * （单查询立即回表一次；multi-query 在全局 RRF 融合后统一回表一次，§23.2）。
+ */
+export async function hybridRecall(
+  tenantId: string,
+  query: string,
+  topK: number,
+  opts: {
+    documentIds?: string[];
+    vector?: number[];
+    timeoutMs?: number;
+  } = {},
+): Promise<HybridRecall> {
+  const timeoutMs = opts.timeoutMs ?? config.retrieverTimeoutMs;
+
+  // 并行执行两路检索：向量（语义）检索 + 关键词（BM25）检索，各取 topK 条
+  const [vectorHits, keywordHits] = await Promise.all([
+    raceTimeout(
+      new VectorRetriever().retrieve(
+        tenantId,
+        query,
+        topK,
+        opts.documentIds,
+        opts.vector,
+      ),
+      timeoutMs,
+      () => [] as RetrievalHit[],
+      "vector",
+    ),
+    raceTimeout(
+      new KeywordRetriever().retrieve(tenantId, query, topK, opts.documentIds),
+      timeoutMs,
+      () => [] as RetrievalHit[],
+      "keyword",
+    ),
+  ]);
+
+  const vectorScore = new Map(vectorHits.map((h) => [h.id, h.score]));
+  const keywordScore = new Map(keywordHits.map((h) => [h.id, h.score]));
+
+  // RRF 融合：将两路各自的排序位置折算为融合分，取 topK
+  const fused = reciprocalRankFusion([
+    vectorHits.map((h, i) => ({ source: "vector", id: h.id, rank: i + 1 })),
+    keywordHits.map((h, i) => ({ source: "keyword", id: h.id, rank: i + 1 })),
+  ]).slice(0, topK);
+
+  const fusionScore = new Map(fused.map((f) => [f.id, f.score]));
+  const sourceById = new Map(
+    fused.map((f) => [
+      f.id,
+      (f.sources.length > 1
+        ? "hybrid"
+        : (f.sources[0] ?? "hybrid")) as "vector" | "keyword" | "hybrid",
+    ]),
+  );
+
+  return {
+    ids: fused.map((f) => f.id),
+    vectorScore,
+    keywordScore,
+    fusionScore,
+    sourceById,
+  };
+}
+
 /** 回表 parent content + 文档元数据，按 childIds 顺序组装证据片段 */
-async function assembleEvidence(
+export async function assembleEvidence(
   tenantId: string,
   childIds: string[],
   documentIds?: string[],
@@ -168,6 +270,8 @@ export interface RetrieveOptions {
   documentIds?: string[];
   /** 预嵌入的查询向量：multi-query 批量路径复用一次 API 请求的向量（§23.2） */
   vector?: number[];
+  /** 单路检索超时（毫秒）：来自 RetrievalPlan.timeout，缺省用全局配置 */
+  timeoutMs?: number;
 }
 
 /**
@@ -196,53 +300,25 @@ export async function retrieveEvidence(
 ): Promise<Evidence[]> {
   const { documentIds } = opts;
 
-  // 1. 并行执行两路检索：向量（语义）检索 + 关键词（BM25）检索，各取 topK 条
-  const [vectorHits, keywordHits] = await Promise.all([
-    new VectorRetriever().retrieve(
-      tenantId,
-      query,
-      topK,
-      documentIds,
-      opts.vector,
-    ),
-    new KeywordRetriever().retrieve(tenantId, query, topK, documentIds),
-  ]);
-
-  // 记录两路检索的原始得分，供后续合并到 Evidence 上
-  const vectorScore = new Map(vectorHits.map((h) => [h.id, h.score]));
-  const keywordScore = new Map(keywordHits.map((h) => [h.id, h.score]));
-
-  // 2. RRF 融合：将两路各自的排序位置折算为融合分，取 topK
-  const fused = reciprocalRankFusion([
-    vectorHits.map((h, i) => ({ source: "vector", id: h.id, rank: i + 1 })),
-    keywordHits.map((h, i) => ({ source: "keyword", id: h.id, rank: i + 1 })),
-  ]).slice(0, topK);
+  // 1-2. 召回段：并行两路检索（各路受超时降级约束，§23.1）→ RRF 融合取 topK
+  const recall = await hybridRecall(tenantId, query, topK, {
+    documentIds: opts.documentIds,
+    vector: opts.vector,
+    timeoutMs: opts.timeoutMs,
+  });
 
   // 没有命中直接返回空
-  if (fused.length === 0) return [];
-
-  // 提取融合分与来源标注：双路命中→hybrid，单路命中→对应来源
-  const fusionScore = new Map(fused.map((f) => [f.id, f.score]));
-  const sourceById = new Map(
-    fused.map((f) => [
-      f.id,
-      f.sources.length > 1 ? "hybrid" : (f.sources[0] ?? "hybrid"),
-    ]),
-  );
+  if (recall.ids.length === 0) return [];
 
   // 3. 按融合出的 chunkId 回表数据库，组装完整 Evidence（原文、标题、父子块等）
-  const evidence = await assembleEvidence(
-    tenantId,
-    fused.map((f) => f.id),
-    documentIds,
-  );
+  const evidence = await assembleEvidence(tenantId, recall.ids, documentIds);
 
   // 4. 合并各路得分与来源，默认以融合分作为排序依据
   for (const e of evidence) {
-    e.vectorScore = vectorScore.get(e.chunkId);
-    e.keywordScore = keywordScore.get(e.chunkId);
-    e.fusionScore = fusionScore.get(e.chunkId);
-    e.source = (sourceById.get(e.chunkId) ??
+    e.vectorScore = recall.vectorScore.get(e.chunkId);
+    e.keywordScore = recall.keywordScore.get(e.chunkId);
+    e.fusionScore = recall.fusionScore.get(e.chunkId);
+    e.source = (recall.sourceById.get(e.chunkId) ??
       "hybrid") as Evidence["source"];
     e.score = e.fusionScore ?? 0;
   }
