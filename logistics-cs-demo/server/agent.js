@@ -6,6 +6,14 @@ import { queryShipment, queryFreight, queryKnowledge } from './tools.js';
 import { startHumanSession, isHumanActive } from './session.js';
 import { createLlm, DEEPSEEK_API_KEY } from './llm.js';
 import * as store from './store.js';
+import {
+  buildContext,
+  recallFact,
+  factDisplay,
+  bumpFact,
+  scheduleExtraction,
+  scheduleIdleSummary
+} from './memory.js';
 
 const MAX_ITERATIONS = 4; // 最多工具调用轮数
 const HISTORY_LIMIT = 20; // 构建 LLM 上下文时最多带的历史轮数
@@ -83,8 +91,8 @@ async function streamFixed(send, text) {
   }
 }
 
-// 按会话构建 LangChain 工具（transfer_human 需要闭包 sessionId）
-function buildTools(sessionId) {
+// 按会话构建 LangChain 工具（transfer_human 闭包 sessionId；query_freight 闭包 userId/send 做记忆兜底）
+function buildTools({ sessionId, userId, send }) {
   const queryShipmentTool = tool(
     async ({ trackingNo }) => {
       const r = await queryShipment({ trackingNo });
@@ -101,7 +109,17 @@ function buildTools(sessionId) {
 
   const queryFreightTool = tool(
     async ({ origin, destination, weightKg }) => {
+      // origin 缺省时用长期记忆兜底（用户常用寄出城市），并提示前端"参考了记忆"
+      let memFact = null;
+      if (!origin && userId) {
+        memFact = recallFact(userId, 'attribute', 'origin_city');
+        if (memFact) origin = memFact.value;
+      }
       const r = await queryFreight({ origin, destination, weightKg });
+      if (memFact) {
+        bumpFact(userId, memFact.id); // 命中：hits+1、confidence 微升
+        send('memory_used', factDisplay(memFact));
+      }
       return JSON.stringify(r);
     },
     {
@@ -147,13 +165,13 @@ function buildTools(sessionId) {
 }
 
 // ---------- Agent 主流程：流式 + 工具调用循环 ----------
-export async function handleAgentMessage({ sessionId, message, send }) {
+export async function handleAgentMessage({ sessionId, message, userId, send }) {
   if (!DEEPSEEK_API_KEY) {
     throw new Error('DEEPSEEK_API_KEY 未配置，请在项目根目录 .env 中配置');
   }
 
   const llm = createLlm();
-  const tools = buildTools(sessionId);
+  const tools = buildTools({ sessionId, userId, send });
   const llmWithTools = llm.bindTools(tools);
   const toolMap = new Map(tools.map((t) => [t.name, t]));
 
@@ -162,7 +180,6 @@ export async function handleAgentMessage({ sessionId, message, send }) {
 
   // 明确的转人工请求：走固定流程，不经 LLM 决策，保证必转成功
   if (isExplicitTransferRequest(message)) {
-    console.log(message)
     send('status', { step: 'intent', label: '意图：转接人工', state: 'done' });
     send('status', { step: 'transfer', label: '发起转人工', state: 'active' });
     startHumanSession(sessionId);
@@ -172,7 +189,13 @@ export async function handleAgentMessage({ sessionId, message, send }) {
     return;
   }
 
-  const messages = [new SystemMessage(SYSTEM_PROMPT), ...buildHistoryMessages(sessionId)];
+  // 长期记忆：把跨会话用户画像（L2）与最近会话摘要（L1）注入为独立 SystemMessage
+  const memory = buildContext(userId);
+  const messages = [
+    new SystemMessage(SYSTEM_PROMPT),
+    ...(memory.block ? [new SystemMessage(memory.block)] : []),
+    ...buildHistoryMessages(sessionId)
+  ];
 
   let toolCounter = 0;
   let finalText = '';
@@ -252,6 +275,12 @@ export async function handleAgentMessage({ sessionId, message, send }) {
     /正在.{0,4}转(接|入工)|已.{0,4}转(接|入工)|已.{0,4}(发起|提交).{0,6}(转接|转人工|人工)/.test(finalText);
   if (!isHumanActive(sessionId) && /人工|真人|投诉/.test(message) && claimsTransferred) {
     startHumanSession(sessionId);
+  }
+
+  // 长期记忆：异步提取（fire-and-forget，不阻塞已结束的回复流）+ 重置会话摘要空闲计时
+  if (userId) {
+    scheduleExtraction({ userId, sessionId, userMsg: message, assistantMsg: finalText });
+    scheduleIdleSummary({ userId, sessionId });
   }
 
   send('done', { intent: 'llm', mode: 'agent' });

@@ -27,6 +27,8 @@ const CHECK_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" st
 
 const state = {
   sessionId: loadSessionId(),
+  userId: loadUserId(),
+  es: null, // 会话级 EventSource
   mode: 'agent', // agent | pending | human
   busy: false,
   agentName: ''
@@ -36,12 +38,27 @@ function loadSessionId() {
   let id = null;
   try { id = localStorage.getItem('cs_session_id'); } catch { /* ignore */ }
   if (!id) {
-    id = (typeof crypto !== 'undefined' && crypto.randomUUID)
-      ? crypto.randomUUID()
-      : 's-' + Date.now() + '-' + Math.random().toString(36).slice(2, 10);
+    id = genId('s');
     try { localStorage.setItem('cs_session_id', id); } catch { /* ignore */ }
   }
   return id;
+}
+
+// 长期记忆命名空间：localStorage 持久，跨会话/刷新不变；无则服务端按"无记忆"处理
+function loadUserId() {
+  let id = null;
+  try { id = localStorage.getItem('cs_user_id'); } catch { /* ignore */ }
+  if (!id) {
+    id = genId('u');
+    try { localStorage.setItem('cs_user_id', id); } catch { /* ignore */ }
+  }
+  return id;
+}
+
+function genId(prefix) {
+  return (typeof crypto !== 'undefined' && crypto.randomUUID)
+    ? `${prefix}-${crypto.randomUUID().slice(0, 12)}`
+    : `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
 /* ---------- 渲染工具 ---------- */
@@ -141,13 +158,23 @@ function showHumanTyping(on) {
   humanTypingEl.classList.toggle('hidden', !on);
 }
 
-/* ---------- 会话级 SSE（EventSource）：转人工全流程 ---------- */
+/* ---------- 会话级 SSE（EventSource）：转人工全流程 + 记忆通知 ---------- */
 function connectEvents() {
+  if (state.es) state.es.close();
   const es = new EventSource(`/api/events?sessionId=${encodeURIComponent(state.sessionId)}`);
+  state.es = es;
   es.onopen = () => setConn(true);
   es.onerror = () => setConn(false);
 
   es.addEventListener('connected', () => setConn(true));
+
+  // 记忆提取结果通知（提取为异步去抖执行，回复结束后若干秒才推送）
+  es.addEventListener('memory_saved', (e) => {
+    const d = JSON.parse(e.data);
+    if (d.action === 'created') addSystem(`已记住：${d.label} · ${d.value}（新会话也会记得）`);
+    else if (d.action === 'updated') addSystem(`记忆已更新：${d.label} · ${d.value}`);
+    else if (d.action === 'deleted') addSystem(`已忘记：${d.label}`);
+  });
 
   es.addEventListener('transfer', (e) => {
     const d = JSON.parse(e.data);
@@ -213,7 +240,7 @@ async function sendMessage(text) {
     const res = await fetch('/api/chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ sessionId: state.sessionId, message: text })
+      body: JSON.stringify({ sessionId: state.sessionId, message: text, userId: state.userId })
     });
     if (!res.ok) {
       let msg = `请求失败（HTTP ${res.status}）`;
@@ -255,6 +282,13 @@ function handleStreamEvent(event, data, { traceEl, bubble, ctx }) {
     ctx.text += data.text;
     bubble.innerHTML = renderStreamMd(ctx.text) + '<span class="cursor"></span>';
     scrollBottom();
+  } else if (event === 'memory_used') {
+    // 本轮回答参考了长期记忆（如 query_freight 兜底了常用寄出城市）
+    upsertTrace(traceEl, {
+      step: 'memory_used',
+      label: `参考记忆 · ${data.label}：${data.value}`,
+      state: 'done'
+    });
   } else if (event === 'done') {
     bubble.innerHTML = md(ctx.text);
   } else if (event === 'error') {
@@ -327,7 +361,7 @@ endHumanBtn.addEventListener('click', async () => {
     await fetch('/api/human/end', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ sessionId: state.sessionId })
+      body: JSON.stringify({ sessionId: state.sessionId, userId: state.userId })
     });
   } catch { /* ignore */ }
 });
@@ -383,6 +417,117 @@ async function loadHistory() {
     return false;
   }
 }
+
+/* ---------- 新会话：换 sessionId，验证跨会话长期记忆 ---------- */
+$('#newSessionBtn').addEventListener('click', async () => {
+  if (state.busy) return;
+  if (state.mode !== 'agent') {
+    try {
+      await fetch('/api/human/end', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sessionId: state.sessionId, userId: state.userId })
+      });
+    } catch { /* ignore */ }
+  }
+  state.sessionId = genId('s');
+  try { localStorage.setItem('cs_session_id', state.sessionId); } catch { /* ignore */ }
+  state.mode = 'agent';
+  state.agentName = '';
+  messagesEl.innerHTML = '';
+  updateMode();
+  setBanner(null);
+  showHumanTyping(false);
+  sessionShortEl.textContent = '会话 ' + state.sessionId.slice(0, 8);
+  connectEvents();
+  addMessage('agent', '已开启新会话。跨会话的长期记忆仍然有效——试试直接问"寄 10kg 到北京多少钱？"，不用再说寄出城市。');
+});
+
+/* ---------- 我的长期记忆面板 ---------- */
+const memoryPanelEl = $('#memoryPanel');
+const memoryFactsEl = $('#memoryFacts');
+const memorySummariesEl = $('#memorySummaries');
+const memoryEmptyEl = $('#memoryEmpty');
+const memoryUserIdEl = $('#memoryUserId');
+
+async function openMemoryPanel() {
+  memoryUserIdEl.textContent = `记忆档案 ${state.userId.slice(0, 14)}`;
+  memoryPanelEl.classList.remove('hidden');
+  await renderMemory();
+}
+
+async function renderMemory() {
+  try {
+    const res = await fetch(`/api/memory?userId=${encodeURIComponent(state.userId)}`);
+    if (!res.ok) throw new Error('加载失败');
+    const data = await res.json();
+    renderFacts(data.facts || []);
+    renderSummaries(data.summaries || []);
+  } catch {
+    memoryFactsEl.innerHTML = '<div class="memory-empty">记忆加载失败，请稍后重试</div>';
+  }
+}
+
+function renderFacts(facts) {
+  memoryEmptyEl.classList.toggle('hidden', facts.length > 0);
+  memoryFactsEl.innerHTML = facts
+    .map(
+      (f) =>
+        `<div class="fact-item" data-id="${escapeHtml(f.id)}">` +
+        '<div class="fact-main">' +
+        `<div class="fact-title"><span class="fact-label">${escapeHtml(f.label)}</span><span class="fact-value">${escapeHtml(f.value)}</span></div>` +
+        `<div class="fact-meta">${escapeHtml(f.typeLabel)} · 置信度 ${Math.round(f.confidence * 100)}% · 被使用 ${f.hits} 次${f.versions ? ` · 更新过 ${f.versions} 次` : ''}</div>` +
+        (f.evidence ? `<div class="fact-evidence">依据："${escapeHtml(f.evidence)}"</div>` : '') +
+        '</div>' +
+        '<button class="fact-del" title="忘记这条">&times;</button>' +
+        '</div>'
+    )
+    .join('');
+}
+
+function renderSummaries(summaries) {
+  const recent = summaries.slice(-3).reverse();
+  if (!recent.length) {
+    memorySummariesEl.innerHTML = '';
+    return;
+  }
+  memorySummariesEl.innerHTML =
+    '<div class="section-title-sm">最近会话摘要</div>' +
+    recent.map((s) => `<div class="summary-item">${escapeHtml(s.summary)}</div>`).join('');
+}
+
+$('#memoryBtn').addEventListener('click', openMemoryPanel);
+$('#memoryCloseBtn').addEventListener('click', () => memoryPanelEl.classList.add('hidden'));
+memoryPanelEl.addEventListener('click', (e) => {
+  if (e.target === memoryPanelEl) memoryPanelEl.classList.add('hidden');
+});
+
+// 忘记我：清空全部长期记忆（合规）
+$('#memoryForgetBtn').addEventListener('click', async () => {
+  if (!confirm('确定清除全部长期记忆？此操作不可恢复。')) return;
+  try {
+    await fetch('/api/memory/forget', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ userId: state.userId })
+    });
+    addSystem('已清除全部长期记忆');
+    renderMemory();
+  } catch { /* ignore */ }
+});
+
+// 单条删除：忘记某条记忆
+memoryFactsEl.addEventListener('click', async (e) => {
+  const del = e.target.closest('.fact-del');
+  if (!del) return;
+  const item = del.closest('.fact-item');
+  try {
+    await fetch(`/api/memory/${encodeURIComponent(state.userId)}/facts/${encodeURIComponent(item.dataset.id)}`, {
+      method: 'DELETE'
+    });
+    renderMemory();
+  } catch { /* ignore */ }
+});
 
 /* ---------- 初始化 ---------- */
 sessionShortEl.textContent = '会话 ' + state.sessionId.slice(0, 8);

@@ -5,10 +5,10 @@ import { ChatDeepSeek } from '@langchain/deepseek';
 export const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY || '';
 export const DEEPSEEK_MODEL = process.env.DEEPSEEK_MODEL || 'deepseek-chat';
 
-export function createLlm() {
+export function createLlm({ temperature = 0.3 } = {}) {
   return new ChatDeepSeek({
     model: DEEPSEEK_MODEL,
-    temperature: 0.3,
+    temperature,
     apiKey: DEEPSEEK_API_KEY,
     maxRetries: 2
   });

@@ -38,6 +38,10 @@
           <span class="cap-ic c-orange"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 13a8 8 0 0 1 16 0"/><rect x="2.5" y="13" width="4.5" height="6.5" rx="2"/><rect x="17" y="13" width="4.5" height="6.5" rx="2"/></svg></span>
           <div><b>转接人工</b><small>排队接入 mock 客服</small></div>
         </li>
+        <li>
+          <span class="cap-ic c-green"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3a3 3 0 0 0-3 3v1H7a3 3 0 0 0-3 3v7a3 3 0 0 0 3 3h10a3 3 0 0 0 3-3v-7a3 3 0 0 0-3-3h-2V6a3 3 0 0 0-3-3z"/><path d="M9 13h6"/><path d="M12 10v6"/></svg></span>
+          <div><b>长期记忆</b><small>跨会话画像 · 可更新可遗忘</small></div>
+        </li>
       </ul>
 
       <div class="section-title">快捷提问</div>
@@ -61,7 +65,11 @@
           <h1>物流智能客服</h1>
           <p id="modeText">智能客服模式 · Mock 数据演示</p>
         </div>
-        <button id="endHumanBtn" class="ghost hidden">结束人工会话</button>
+        <div class="head-actions">
+          <button id="memoryBtn" class="ghost ghost-blue">我的记忆</button>
+          <button id="newSessionBtn" class="ghost ghost-blue">新会话</button>
+          <button id="endHumanBtn" class="ghost hidden">结束人工会话</button>
+        </div>
       </header>
 
       <div id="banner" class="banner hidden"></div>
@@ -84,6 +92,28 @@
       </footer>
     </main>
   </div>
+
+  <!-- 我的长期记忆面板 -->
+  <div id="memoryPanel" class="panel-mask hidden">
+    <div class="panel" role="dialog" aria-label="我的长期记忆">
+      <div class="panel-head">
+        <div>
+          <h2>我的长期记忆</h2>
+          <p class="panel-sub" id="memoryUserId"></p>
+        </div>
+        <div class="panel-actions">
+          <button id="memoryForgetBtn" class="ghost">忘记我</button>
+          <button id="memoryCloseBtn" class="panel-close" aria-label="关闭">&times;</button>
+        </div>
+      </div>
+      <div class="panel-body">
+        <div id="memoryFacts" class="fact-list"></div>
+        <div id="memorySummaries" class="summary-list"></div>
+        <div id="memoryEmpty" class="memory-empty hidden">暂无长期记忆。和我多聊几句，比如"我常从杭州发货"，我会记住并在新会话中使用。</div>
+      </div>
+    </div>
+  </div>
+
   <script src="./app.js"></script>
 </body>
 </html>

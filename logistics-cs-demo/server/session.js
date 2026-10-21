@@ -30,6 +30,11 @@ export function addChannel(sessionId, res) {
   };
 }
 
+// 供外部模块（如长期记忆系统）经会话级通道推送事件；无在线通道时静默忽略
+export function pushEvent(sessionId, event, data) {
+  push(sessionId, event, data);
+}
+
 // ---------- 人工会话状态持久化与恢复 ----------
 // 状态每次变更都写入 store（data/history.json 的 human 字段），
 // 服务重启后内存 Map 为空，首次访问时从持久层恢复：
