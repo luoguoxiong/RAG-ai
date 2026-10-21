@@ -62,6 +62,13 @@ body {
   transition: all .15s ease;
 }
 .quick button:hover { border-color: var(--primary); color: var(--primary); background: #eef3ff; }
+.agent-entry {
+  display: block; width: 100%; text-align: center;
+  border: 1px dashed #fdba9c; background: #fff7ed; color: #c2410c;
+  font-size: 12.5px; padding: 8px 11px; border-radius: 999px; cursor: pointer;
+  text-decoration: none; transition: all .15s ease;
+}
+.agent-entry:hover { background: #ffedd5; }
 
 .sidebar-foot { margin-top: auto; padding-top: 14px; display: flex; align-items: center; gap: 7px; font-size: 12.5px; color: var(--muted); }
 .dot { width: 8px; height: 8px; border-radius: 50%; background: #f59e0b; flex: none; }

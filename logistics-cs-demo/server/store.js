@@ -1,77 +1,117 @@
-// ============ 本地 JSON 持久层：对话历史存储 ============
-// 演示期用本地 JSON 文件（data/history.json）持久化所有会话消息；
-// 后续接入数据库时只需替换本文件的 getMessages/appendMessage 实现，上层无需改动。
-import fs from 'node:fs';
-import path from 'node:path';
-import { fileURLToPath } from 'node:url';
-
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const DATA_DIR = path.join(__dirname, '..', 'data');
-const DATA_FILE = path.join(DATA_DIR, 'history.json');
+// ============ PostgreSQL 持久层：会话 / 消息 / 人工客服状态 ============
+// 由本地 JSON（data/history.json）迁移至 PostgreSQL：
+//   - chat_sessions：会话行 + 人工会话状态（human_status 等字段）
+//   - chat_messages：会话消息（role/content/ts）
+//   - support_human：客服表（人工接入时从这里取客服）
+// 导出接口与原 JSON 版一致，仅由同步改为 async，上层调用点补 await 即可。
+import { pool, ensureSession } from './db.js';
 
 const MAX_MESSAGES_PER_SESSION = 200; // 每个会话最多保留的消息条数
 
-let db = null;
-
-function load() {
-  if (db) return db;
-  try {
-    db = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
-  } catch {
-    db = { sessions: {} };
-  }
-  if (!db || typeof db !== 'object') db = { sessions: {} };
-  if (!db.sessions) db.sessions = {};
-  return db;
-}
-
-// 原子写入：先写临时文件再 rename，避免写一半损坏
-function save() {
-  fs.mkdirSync(DATA_DIR, { recursive: true });
-  const tmp = `${DATA_FILE}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(db, null, 2), 'utf8');
-  fs.renameSync(tmp, DATA_FILE);
-}
-
-export function getMessages(sessionId) {
-  const s = load().sessions[sessionId];
-  return s ? s.messages : [];
+/**
+ * 拉取会话全部消息（按写入顺序）
+ * 返回 [{ id, role, name, content, ts }]
+ */
+export async function getMessages(sessionId) {
+  const { rows } = await pool.query(
+    `SELECT id, role, name, content, ts
+     FROM chat_messages
+     WHERE session_id = $1
+     ORDER BY id ASC;`,
+    [sessionId]
+  );
+  return rows;
 }
 
 /**
  * 追加一条消息：{ role, content, name?, ts? }
  * role: 'user' | 'assistant' | 'human_agent' | 'system'
+ * 超出保留上限时删除最早的消息。
  */
-export function appendMessage(sessionId, msg) {
-  const d = load();
-  if (!d.sessions[sessionId]) {
-    d.sessions[sessionId] = { sessionId, createdAt: Date.now(), messages: [] };
-  }
-  const s = d.sessions[sessionId];
-  s.updatedAt = Date.now();
-  s.messages.push({ ts: Date.now(), ...msg });
-  while (s.messages.length > MAX_MESSAGES_PER_SESSION) s.messages.shift();
-  save();
-  return s.messages;
+export async function appendMessage(sessionId, msg) {
+  await ensureSession(sessionId);
+  const { rows } = await pool.query(
+    `INSERT INTO chat_messages (session_id, role, name, content, ts)
+     VALUES ($1, $2, $3, $4, $5)
+     RETURNING id, role, name, content, ts;`,
+    [sessionId, msg.role, msg.name ?? null, String(msg.content), msg.ts ?? Date.now()]
+  );
+  // 会话行 updated_at 刷新 + 消息滚动截断
+  await pool.query(`UPDATE chat_sessions SET updated_at = now() WHERE session_id = $1;`, [sessionId]);
+  await pool.query(
+    `DELETE FROM chat_messages
+     WHERE session_id = $1
+       AND id NOT IN (
+         SELECT id FROM chat_messages WHERE session_id = $1 ORDER BY id DESC LIMIT $2
+       );`,
+    [sessionId, MAX_MESSAGES_PER_SESSION]
+  );
+  return rows[0];
 }
 
 // ---------- 人工客服会话状态持久化 ----------
-// 人工会话（排队中/已接入）状态挂在会话记录的 human 字段，服务重启后可恢复。
+// 人工会话（排队中/已接入）状态落在 chat_sessions 的 human_* 字段，服务重启后可恢复。
 // 形如 { status: 'queued'|'active'|'ended', queuePosition, agent, joinAt, updatedAt }
 
-export function getHumanState(sessionId) {
-  const s = load().sessions[sessionId];
-  return s && s.human ? { ...s.human } : null;
+export async function getHumanState(sessionId) {
+  const { rows } = await pool.query(
+    `SELECT s.human_status, s.human_queue_position, s.human_join_at, s.human_updated_at,
+            a.id AS agent_id, a.name AS agent_name, a.code AS agent_code
+     FROM chat_sessions s
+     LEFT JOIN support_human a ON a.id = s.human_agent_id
+     WHERE s.session_id = $1;`,
+    [sessionId]
+  );
+  const s = rows[0];
+  if (!s || !s.human_status) return null;
+  return {
+    status: s.human_status,
+    queuePosition: s.human_queue_position ?? null,
+    agent: s.agent_id ? { id: s.agent_id, name: s.agent_name, code: s.agent_code } : null,
+    joinAt: s.human_join_at ?? null,
+    updatedAt: s.human_updated_at ?? null
+  };
 }
 
-export function setHumanState(sessionId, human) {
-  const d = load();
-  if (!d.sessions[sessionId]) {
-    d.sessions[sessionId] = { sessionId, createdAt: Date.now(), messages: [] };
+export async function setHumanState(sessionId, human) {
+  await ensureSession(sessionId);
+  // agent 兼容两种形态：{ id } / { name, code }，统一解析为客服 id
+  let agentId = null;
+  if (human.agent) {
+    if (human.agent.id) {
+      agentId = human.agent.id;
+    } else {
+      const { rows } = await pool.query(
+        `SELECT id FROM support_human WHERE code = $1;`,
+        [human.agent.code]
+      );
+      agentId = rows[0]?.id ?? null;
+    }
   }
-  const s = d.sessions[sessionId];
-  s.updatedAt = Date.now();
-  s.human = { ...human, updatedAt: Date.now() };
-  save();
-  return s.human;
+  const { rows } = await pool.query(
+    `UPDATE chat_sessions SET
+       human_status = $2,
+       human_queue_position = $3,
+       human_agent_id = $4,
+       human_join_at = $5,
+       human_updated_at = $6
+     WHERE session_id = $1
+     RETURNING human_status, human_queue_position, human_agent_id, human_join_at, human_updated_at;`,
+    [
+      sessionId,
+      human.status ?? null,
+      human.queuePosition ?? null,
+      agentId,
+      human.joinAt ?? null,
+      Date.now()
+    ]
+  );
+  const s = rows[0];
+  return {
+    status: s.human_status,
+    queuePosition: s.human_queue_position,
+    agent: human.agent ?? null,
+    joinAt: s.human_join_at,
+    updatedAt: s.human_updated_at
+  };
 }

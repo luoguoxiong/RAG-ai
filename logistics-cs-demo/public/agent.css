@@ -1,0 +1,84 @@
+/* ============ 客服工作台补充样式（复用 style.css 变量与基础组件） ============ */
+
+.brand-logo-orange { background: linear-gradient(135deg, #ea580c, #fb923c); }
+.ghost-mini { font-size: 12px; padding: 4px 10px; }
+
+/* ---------- 客服列表 ---------- */
+.human-list { display: flex; flex-direction: column; gap: 8px; }
+.human-loading { color: var(--muted); font-size: 13px; padding: 8px 4px; }
+
+.human-card {
+  display: flex; align-items: center; gap: 10px;
+  padding: 10px; border: 1px solid var(--border); border-radius: 12px;
+  background: var(--panel);
+}
+.human-card .avatar-sm {
+  width: 38px; height: 38px; border-radius: 50%; flex: none;
+  display: flex; align-items: center; justify-content: center;
+  background: linear-gradient(135deg, #ea580c, #fb923c); color: #fff;
+  font-size: 15px; font-weight: 600;
+}
+.human-info { flex: 1; min-width: 0; }
+.human-info b { display: block; font-size: 13.5px; }
+.human-info small { color: var(--muted); font-size: 12px; }
+
+.status-pill {
+  display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 11px; margin-top: 3px;
+}
+.status-pill.online { background: #dcfce7; color: #15803d; }
+.status-pill.offline { background: #e5e7eb; color: #6b7280; }
+
+.human-card .ghost { padding: 6px 12px; font-size: 12.5px; white-space: nowrap; }
+
+/* ---------- 会话列表 ---------- */
+.conv-count { color: var(--primary); }
+.conv-list { display: flex; flex-direction: column; gap: 6px; }
+.conv-item {
+  display: flex; align-items: center; gap: 10px;
+  padding: 10px; border-radius: 12px; border: 1px solid transparent;
+  cursor: pointer; transition: all .15s ease;
+}
+.conv-item:hover { background: #f1f4fa; }
+.conv-item.active { background: #eef3ff; border-color: #c7d7fe; }
+
+.conv-ic {
+  width: 34px; height: 34px; border-radius: 10px; flex: none;
+  display: flex; align-items: center; justify-content: center;
+  background: linear-gradient(135deg, #64748b, #94a3b8); color: #fff;
+}
+.conv-ic svg { width: 17px; height: 17px; }
+.conv-main { flex: 1; min-width: 0; }
+.conv-main b {
+  display: block; font-size: 12.5px; font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+.conv-main small {
+  display: block; color: var(--muted); font-size: 12px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-top: 2px;
+}
+.conv-badge {
+  min-width: 18px; height: 18px; border-radius: 999px; flex: none;
+  background: #ef4444; color: #fff; font-size: 11px; font-weight: 600;
+  display: flex; align-items: center; justify-content: center; padding: 0 5px;
+}
+.conv-item.ended { opacity: .55; }
+
+.conv-empty { color: var(--muted); font-size: 13px; text-align: center; padding: 18px 8px; line-height: 1.8; }
+
+/* ---------- 消息区（客服视角：客服消息在右） ---------- */
+.agent-app .msg.by-agent { flex-direction: row-reverse; }
+.agent-app .msg.by-agent .body { align-items: flex-end; }
+
+.agent-empty {
+  margin: auto; text-align: center; color: var(--muted); padding: 30px 20px;
+}
+.agent-empty-ic {
+  width: 64px; height: 64px; margin: 0 auto 14px; border-radius: 18px;
+  display: flex; align-items: center; justify-content: center;
+  background: #eef1f7; color: #93a0bd;
+}
+.agent-empty-ic svg { width: 30px; height: 30px; }
+.agent-empty h3 { color: var(--text); margin: 0 0 8px; font-size: 16px; }
+.agent-empty p { margin: 0; font-size: 13px; line-height: 1.9; }
+
+.agent-typing { text-align: center; color: var(--muted); font-size: 12.5px; padding: 6px 0 2px; }

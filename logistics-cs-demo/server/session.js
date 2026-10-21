@@ -2,9 +2,11 @@
 // 每个浏览器会话通过 GET /api/events?sessionId=xxx 建立一条长连接 EventSource，
 // 服务端通过该通道推送：转人工排队、人工接入、人工消息、输入中、会话结束等事件。
 import * as store from './store.js';
+import { pool } from './db.js';
 
 const channels = new Map(); // sessionId -> Set<ServerResponse>
 const humanSessions = new Map(); // sessionId -> human session
+const agentChannels = new Map(); // agentId -> Set<ServerResponse>（客服工作台长连接）
 
 function push(sessionId, event, data) {
   const set = channels.get(sessionId);
@@ -17,6 +19,37 @@ function push(sessionId, event, data) {
       // 连接已断开，忽略
     }
   }
+}
+
+// 客服工作台通道：新会话分配 / 用户新消息 / 会话结束 都经此推送
+export function addAgentChannel(agentId, res) {
+  if (!agentChannels.has(agentId)) agentChannels.set(agentId, new Set());
+  const set = agentChannels.get(agentId);
+  set.add(res);
+  res.write(`event: connected\ndata: ${JSON.stringify({ agentId, ts: Date.now() })}\n\n`);
+  return () => {
+    set.delete(res);
+    if (!set.size) agentChannels.delete(agentId);
+  };
+}
+
+export function pushAgentEvent(agentId, event, data) {
+  const set = agentChannels.get(agentId);
+  if (!set) return;
+  const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+  for (const res of set) {
+    try {
+      res.write(payload);
+    } catch {
+      // 连接已断开，忽略
+    }
+  }
+}
+
+// 该客服的工作台是否在线（决定用户消息走真人回复还是 mock 自动兜底）
+export function isAgentOnline(agentId) {
+  const set = agentChannels.get(agentId);
+  return !!set && set.size > 0;
 }
 
 export function addChannel(sessionId, res) {
@@ -36,15 +69,25 @@ export function pushEvent(sessionId, event, data) {
 }
 
 // ---------- 人工会话状态持久化与恢复 ----------
-// 状态每次变更都写入 store（data/history.json 的 human 字段），
+// 状态每次变更都写入 PostgreSQL（chat_sessions.human_* 字段），
 // 服务重启后内存 Map 为空，首次访问时从持久层恢复：
 // - active：直接恢复，人工消息可继续收发
 // - queued：按 joinAt 续排接入定时器；已过期的立即补上接入
 const JOIN_DELAY_MS = 4000; // 排队后多久 mock 客服接入
 const HUMAN_STATE_TTL_MS = 24 * 60 * 60 * 1000; // 超过 24h 的残留人工状态视为已结束
 
-function persistHuman(s) {
-  store.setHumanState(s.sessionId, {
+const FALLBACK_AGENT = { name: '林晓', code: 'CS1024' }; // 客服表为空时的兜底
+
+// 从 support_human 客服表取一位在线客服
+async function pickAgent() {
+  const { rows } = await pool.query(
+    `SELECT id, name, code FROM support_human WHERE status = 'online' ORDER BY id LIMIT 1;`
+  );
+  return rows[0] ? { id: rows[0].id, name: rows[0].name, code: rows[0].code } : { ...FALLBACK_AGENT };
+}
+
+async function persistHuman(s) {
+  await store.setHumanState(s.sessionId, {
     status: s.status,
     queuePosition: s.queuePosition ?? null,
     agent: s.agent || null,
@@ -53,14 +96,14 @@ function persistHuman(s) {
 }
 
 // 从持久层取人工会话（内存没有时自动恢复）
-function getSession(sessionId) {
+async function getSession(sessionId) {
   let s = humanSessions.get(sessionId);
   if (s) return s;
 
-  const saved = store.getHumanState(sessionId);
+  const saved = await store.getHumanState(sessionId);
   if (!saved || saved.status === 'ended') return null;
   if (saved.updatedAt && Date.now() - saved.updatedAt > HUMAN_STATE_TTL_MS) {
-    store.setHumanState(sessionId, { status: 'ended' }); // 残留状态过期清理
+    await store.setHumanState(sessionId, { status: 'ended' }); // 残留状态过期清理
     return null;
   }
 
@@ -74,64 +117,35 @@ function getSession(sessionId) {
   };
   humanSessions.set(sessionId, s);
   if (s.status === 'queued' && s.joinAt) {
-    if (Date.now() >= s.joinAt) activate(s, true);
-    else s.timers.push(setTimeout(() => activate(s), Math.max(0, s.joinAt - Date.now())));
+    if (Date.now() >= s.joinAt) activate(s, true).catch(() => {});
+    else s.timers.push(setTimeout(() => activate(s).catch(() => {}), Math.max(0, s.joinAt - Date.now())));
   }
   return s;
 }
 
-// ---------- 人工客服（mock：排队 -> 接入 -> 关键词应答） ----------
-const HUMAN_REPLIES = [
-  {
-    test: /投诉/,
-    text: '非常抱歉给您带来了不好的体验。我已记录您的反馈（工单号 TS-20261021-048），专班会在 2 小时内与您电话联系。方便告诉我运单号吗？我帮您加急处理。'
-  },
-  {
-    test: /丢|丢失|丢件|理赔|破损|坏/,
-    text: '收到，很抱歉给您造成损失。我已为您登记理赔工单 CL-20261021-112，理赔专员将在 24 小时内联系您。麻烦您保留外包装和物品照片作为凭证，方便定损。'
-  },
-  {
-    test: /改地址|修改地址|换地址/,
-    text: '好的，请提供运单号和新收件地址，我马上提交改址申请，一般 30 分钟内生效，不影响时效。'
-  },
-  {
-    test: /催|太慢|迟迟/,
-    text: '非常理解您着急的心情，我已帮您向派送网点发起催派，并备注了您的联系方式，预计今天 18:00 前给您答复。'
-  },
-  {
-    test: /退回|拒收|退货/,
-    text: '可以的呢。包裹拒收后会原路退回寄件人，退回运费视原因由责任方承担。需要我帮您提交拒收登记吗？'
-  },
-  {
-    test: /保价/,
-    text: '保价费率为声明价值的 0.5%（最低 1 元），单票最高 5 万元。3000 元以上的物品建议保价，出险后按保价金额赔付。'
-  }
-];
-const DEFAULT_REPLY = '好的，您的问题我已记录（工单号 GD-20261021-236），我会持续跟进并第一时间回复您。请问还有其他需要帮忙的吗？';
+// ---------- 人工客服（排队 -> 客服接入 -> 真人回复） ----------
 
-function pickHumanReply(text) {
-  for (const r of HUMAN_REPLIES) if (r.test.test(text)) return r.text;
-  return DEFAULT_REPLY;
-}
-
-// mock 客服接入：推送接入事件 + 问候语（immediate=true 用于重启后补推）
-function activate(s, immediate = false) {
+// 客服接入：推送接入事件 + 通知客服工作台有新会话（immediate=true 用于重启后补推）
+async function activate(s, immediate = false) {
   s.status = 'active';
-  s.agent = { name: '林晓', code: 'CS1024' };
-  persistHuman(s);
+  s.agent = await pickAgent(); // 从 support_human 客服表取在线客服
+  await persistHuman(s);
   push(s.sessionId, 'human_joined', { agent: s.agent });
-  const pushGreeting = () => {
-    const greeting = '您好，我是人工客服林晓（工号 CS1024），很高兴为您服务。请描述一下您遇到的问题，我会尽力帮您处理。';
-    store.appendMessage(s.sessionId, { role: 'human_agent', name: s.agent.name, content: greeting });
+  if (s.agent.id) {
+    pushAgentEvent(s.agent.id, 'session_assigned', { sessionId: s.sessionId, agent: s.agent });
+  }
+  const pushGreeting = async () => {
+    const greeting = `您好，我是人工客服${s.agent.name}（工号 ${s.agent.code}），很高兴为您服务。请描述一下您遇到的问题，我会尽力帮您处理。`;
+    await store.appendMessage(s.sessionId, { role: 'human_agent', name: s.agent.name, content: greeting });
     push(s.sessionId, 'human_message', { from: 'agent', text: greeting });
   };
-  if (immediate) pushGreeting();
-  else s.timers.push(setTimeout(pushGreeting, 900));
+  if (immediate) await pushGreeting();
+  else s.timers.push(setTimeout(() => pushGreeting().catch(() => {}), 900));
 }
 
 // 发起转人工：推送排队事件，4 秒后 mock 客服接入
-export function startHumanSession(sessionId) {
-  const prev = getSession(sessionId);
+export async function startHumanSession(sessionId) {
+  const prev = await getSession(sessionId);
   if (prev && prev.status !== 'ended') return prev;
 
   const s = {
@@ -143,55 +157,73 @@ export function startHumanSession(sessionId) {
     timers: []
   };
   humanSessions.set(sessionId, s);
-  persistHuman(s);
-  store.appendMessage(sessionId, { role: 'system', content: '会话已转接人工客服，排队中' });
+  await persistHuman(s);
+  await store.appendMessage(sessionId, { role: 'system', content: '会话已转接人工客服，排队中' });
   push(sessionId, 'transfer', { queuePosition: s.queuePosition, estimatedWaitMin: 2 });
 
-  s.timers.push(setTimeout(() => activate(s), JOIN_DELAY_MS));
+  s.timers.push(setTimeout(() => activate(s).catch(() => {}), JOIN_DELAY_MS));
   return s;
 }
 
-// 用户在人工模式下发消息 -> mock 客服"输入中"后回复
-export function humanUserMessage(sessionId, text) {
-  const s = getSession(sessionId);
+// 用户在人工模式下发消息：全部走真人回复
+// - 客服工作台在线 -> 实时推送给客服，等待客服手动回复（agentReply）
+// - 客服工作台离线 -> 消息入库并告知用户（仅提示一次，不会自动应答）
+export async function humanUserMessage(sessionId, text) {
+  const s = await getSession(sessionId);
   if (!s || s.status === 'ended') return false;
-  store.appendMessage(sessionId, { role: 'user', content: text });
+  await store.appendMessage(sessionId, { role: 'user', content: text });
   if (s.status !== 'active') {
     const notice = '客服正在接入中，您的消息已记录，接入后会第一时间回复您。';
-    store.appendMessage(sessionId, { role: 'system', content: notice });
+    await store.appendMessage(sessionId, { role: 'system', content: notice });
     push(sessionId, 'human_message', { from: 'system', text: notice });
     return true;
   }
-  const reply = pickHumanReply(text);
-  s.timers.push(setTimeout(() => push(sessionId, 'human_typing', { typing: true }), 500));
-  s.timers.push(
-    setTimeout(() => {
-      store.appendMessage(sessionId, { role: 'human_agent', name: '林晓', content: reply });
-      push(sessionId, 'human_typing', { typing: false });
-      push(sessionId, 'human_message', { from: 'agent', text: reply });
-    }, 1500 + Math.random() * 900)
-  );
+  const agentId = s.agent?.id;
+  if (agentId && isAgentOnline(agentId)) {
+    // 真人模式：推送到客服工作台，由客服手动回复（agentReply）
+    pushAgentEvent(agentId, 'user_message', { sessionId, text, agent: s.agent });
+    return true;
+  }
+  // 客服离线：消息照常入库，告知用户已记录（同一会话只提示一次）
+  if (!s.offlineNotified) {
+    s.offlineNotified = true;
+    const notice = '客服暂时离开，您的消息已记录，客服回到工作台后会第一时间回复您。';
+    await store.appendMessage(sessionId, { role: 'system', content: notice });
+    push(sessionId, 'human_message', { from: 'system', text: notice });
+  }
   return true;
 }
 
+// 客服工作台回复用户：消息入库 + 经用户会话级 SSE 实时送达
+export async function agentReply({ agentId, sessionId, text }) {
+  const s = await getSession(sessionId);
+  if (!s || s.status !== 'active') return { ok: false, error: '会话已结束或不存在' };
+  if (!s.agent || s.agent.id !== Number(agentId)) return { ok: false, error: '该会话未分配给当前客服' };
+  await store.appendMessage(sessionId, { role: 'human_agent', name: s.agent.name, content: text });
+  push(sessionId, 'human_typing', { typing: false });
+  push(sessionId, 'human_message', { from: 'agent', text, name: s.agent.name });
+  return { ok: true };
+}
+
 // 结束人工会话（用户点击或兜底）
-export function endHumanSession(sessionId) {
-  const s = getSession(sessionId);
+export async function endHumanSession(sessionId) {
+  const s = await getSession(sessionId);
   if (!s) {
     // 重启后内存无该会话时，也确保持久化状态被标记为结束
-    const saved = store.getHumanState(sessionId);
-    if (saved && saved.status !== 'ended') store.setHumanState(sessionId, { status: 'ended' });
+    const saved = await store.getHumanState(sessionId);
+    if (saved && saved.status !== 'ended') await store.setHumanState(sessionId, { status: 'ended' });
     return;
   }
   for (const t of s.timers) clearTimeout(t);
   s.timers = [];
   s.status = 'ended';
-  persistHuman(s);
-  store.appendMessage(sessionId, { role: 'system', content: '人工会话已结束，已切回智能客服模式' });
+  await persistHuman(s);
+  await store.appendMessage(sessionId, { role: 'system', content: '人工会话已结束，已切回智能客服模式' });
   push(sessionId, 'human_ended', {});
+  if (s.agent?.id) pushAgentEvent(s.agent.id, 'session_ended', { sessionId });
 }
 
-export function isHumanActive(sessionId) {
-  const s = getSession(sessionId);
+export async function isHumanActive(sessionId) {
+  const s = await getSession(sessionId);
   return !!s && s.status !== 'ended';
 }

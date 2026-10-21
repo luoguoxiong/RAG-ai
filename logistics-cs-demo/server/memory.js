@@ -331,7 +331,7 @@ export function cancelIdleSummary(sessionId) {
 
 // 摘要已有更新的版本则跳过（以会话最后一条消息时间为基准去重）
 export async function summarizeSession({ userId, sessionId }) {
-  const msgs = store.getMessages(sessionId).filter((m) => m.role === 'user' || m.role === 'assistant');
+  const msgs = (await store.getMessages(sessionId)).filter((m) => m.role === 'user' || m.role === 'assistant');
   if (!msgs.length) return false;
   const lastTs = msgs[msgs.length - 1].ts || 0;
   const existing = memstore.getSummaries(userId).find((s) => s.sessionId === sessionId);

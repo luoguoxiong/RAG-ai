@@ -41,9 +41,8 @@ function isExplicitTransferRequest(message) {
 }
 
 // 从持久层加载对话历史（仅取用户/助手文本轮次）构建 LLM 上下文
-function buildHistoryMessages(sessionId) {
-  return store
-    .getMessages(sessionId)
+async function buildHistoryMessages(sessionId) {
+  return (await store.getMessages(sessionId))
     .filter((m) => m.role === 'user' || m.role === 'assistant')
     .slice(-HISTORY_LIMIT)
     .map((m) => (m.role === 'user' ? new HumanMessage(m.content) : new AIMessage(m.content)));
@@ -149,7 +148,7 @@ function buildTools({ sessionId, userId, send }) {
 
   const transferHumanTool = tool(
     async () => {
-      startHumanSession(sessionId);
+      await startHumanSession(sessionId);
       return JSON.stringify({ ok: true, summary: '已发起转人工，排队信息已推送给用户' });
     },
     {
@@ -166,6 +165,20 @@ function buildTools({ sessionId, userId, send }) {
 
 // ---------- Agent 主流程：流式 + 工具调用循环 ----------
 export async function handleAgentMessage({ sessionId, message, userId, send }) {
+  // 先持久化用户消息，再从存储构建上下文
+  await store.appendMessage(sessionId, { role: 'user', content: message });
+
+  // 明确的转人工请求：走固定流程，不经 LLM 决策，保证必转成功（未配置 LLM key 也可转人工）
+  if (isExplicitTransferRequest(message)) {
+    send('status', { step: 'intent', label: '意图：转接人工', state: 'done' });
+    send('status', { step: 'transfer', label: '发起转人工', state: 'active' });
+    await startHumanSession(sessionId);
+    await streamFixed(send, TRANSFER_REPLY);
+    send('status', { step: 'transfer', label: '已发起转接，等待客服接入', state: 'done' });
+    send('done', { intent: 'transfer_human', mode: 'human' });
+    return;
+  }
+
   if (!DEEPSEEK_API_KEY) {
     throw new Error('DEEPSEEK_API_KEY 未配置，请在项目根目录 .env 中配置');
   }
@@ -175,26 +188,12 @@ export async function handleAgentMessage({ sessionId, message, userId, send }) {
   const llmWithTools = llm.bindTools(tools);
   const toolMap = new Map(tools.map((t) => [t.name, t]));
 
-  // 先持久化用户消息，再从存储构建上下文
-  store.appendMessage(sessionId, { role: 'user', content: message });
-
-  // 明确的转人工请求：走固定流程，不经 LLM 决策，保证必转成功
-  if (isExplicitTransferRequest(message)) {
-    send('status', { step: 'intent', label: '意图：转接人工', state: 'done' });
-    send('status', { step: 'transfer', label: '发起转人工', state: 'active' });
-    startHumanSession(sessionId);
-    await streamFixed(send, TRANSFER_REPLY);
-    send('status', { step: 'transfer', label: '已发起转接，等待客服接入', state: 'done' });
-    send('done', { intent: 'transfer_human', mode: 'human' });
-    return;
-  }
-
   // 长期记忆：把跨会话用户画像（L2）与最近会话摘要（L1）注入为独立 SystemMessage
   const memory = buildContext(userId);
   const messages = [
     new SystemMessage(SYSTEM_PROMPT),
     ...(memory.block ? [new SystemMessage(memory.block)] : []),
-    ...buildHistoryMessages(sessionId)
+    ...await buildHistoryMessages(sessionId)
   ];
 
   let toolCounter = 0;
@@ -266,15 +265,15 @@ export async function handleAgentMessage({ sessionId, message, userId, send }) {
   }
 
   if (finalText.trim()) {
-    store.appendMessage(sessionId, { role: 'assistant', content: finalText });
+    await store.appendMessage(sessionId, { role: 'assistant', content: finalText });
   }
 
   // 兜底：用户明确要转人工，模型嘴上说"正在/已转接"却没调工具 -> 补触发，避免用户干等。
   // 只识别"声称已转接"的陈述句式，不识别"可以为您转接/需要我帮您转接吗"这类提议，避免误伤（如"投诉流程是什么"）。
   const claimsTransferred =
     /正在.{0,4}转(接|入工)|已.{0,4}转(接|入工)|已.{0,4}(发起|提交).{0,6}(转接|转人工|人工)/.test(finalText);
-  if (!isHumanActive(sessionId) && /人工|真人|投诉/.test(message) && claimsTransferred) {
-    startHumanSession(sessionId);
+  if (!(await isHumanActive(sessionId)) && /人工|真人|投诉/.test(message) && claimsTransferred) {
+    await startHumanSession(sessionId);
   }
 
   // 长期记忆：异步提取（fire-and-forget，不阻塞已结束的回复流）+ 重置会话摘要空闲计时

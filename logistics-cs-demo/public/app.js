@@ -292,7 +292,7 @@ function handleStreamEvent(event, data, { traceEl, bubble, ctx }) {
   } else if (event === 'done') {
     bubble.innerHTML = md(ctx.text);
   } else if (event === 'error') {
-    bubble.innerHTML = md('抱歉，服务出现异常，请稍后重试。');
+    bubble.innerHTML = md(`抱歉，服务出现异常：${data.message || '请稍后重试'}`);
   }
 }
 /* ---------- 人工模式发消息 ---------- */

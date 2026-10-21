@@ -4,13 +4,16 @@
 import express from 'express';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { initDb, pool } from './db.js';
 import { handleAgentMessage } from './agent.js';
 import {
   addChannel,
+  addAgentChannel,
   humanUserMessage,
   startHumanSession,
   endHumanSession,
-  isHumanActive
+  isHumanActive,
+  agentReply
 } from './session.js';
 import * as store from './store.js';
 import {
@@ -55,7 +58,7 @@ app.post('/api/chat', async (req, res) => {
     res.status(400).json({ error: 'sessionId 与 message 必填' });
     return;
   }
-  if (isHumanActive(sessionId)) {
+  if (await isHumanActive(sessionId)) {
     res.status(409).json({ error: 'session_in_human_mode', message: '当前会话已转人工，请直接与人工客服沟通' });
     return;
   }
@@ -72,25 +75,34 @@ app.post('/api/chat', async (req, res) => {
   res.end();
 });
 
-// 历史对话查询（本地 JSON 持久化，后续可换存储库）
+// 历史对话查询（PostgreSQL 持久化）
 // human：当前人工会话状态（queued/active/ended），前端刷新后据此恢复人工模式
-app.get('/api/history', (req, res) => {
+app.get('/api/history', async (req, res) => {
   const sessionId = String(req.query.sessionId || '');
   if (!sessionId) {
     res.status(400).json({ error: 'sessionId 必填' });
     return;
   }
-  res.json({ sessionId, messages: store.getMessages(sessionId), human: store.getHumanState(sessionId) });
+  try {
+    const [messages, human] = await Promise.all([
+      store.getMessages(sessionId),
+      store.getHumanState(sessionId)
+    ]);
+    res.json({ sessionId, messages, human });
+  } catch (err) {
+    console.error('[history] 查询异常:', err);
+    res.status(500).json({ error: '历史记录查询失败' });
+  }
 });
 
 // 人工模式：用户发消息给 mock 客服
-app.post('/api/human/message', (req, res) => {
+app.post('/api/human/message', async (req, res) => {
   const { sessionId, message } = req.body || {};
   if (!sessionId || !String(message || '').trim()) {
     res.status(400).json({ error: 'sessionId 与 message 必填' });
     return;
   }
-  const ok = humanUserMessage(sessionId, String(message).trim());
+  const ok = await humanUserMessage(sessionId, String(message).trim());
   if (!ok) {
     res.status(409).json({ error: 'no_human_session', message: '当前没有进行中的人工会话' });
     return;
@@ -99,13 +111,13 @@ app.post('/api/human/message', (req, res) => {
 });
 
 // 结束人工会话（并触发该会话的长期记忆摘要）
-app.post('/api/human/end', (req, res) => {
+app.post('/api/human/end', async (req, res) => {
   const { sessionId, userId } = req.body || {};
   if (!sessionId) {
     res.status(400).json({ error: 'sessionId 必填' });
     return;
   }
-  endHumanSession(sessionId);
+  await endHumanSession(sessionId);
   if (userId) {
     cancelIdleSummary(sessionId);
     summarizeSession({ userId: String(userId), sessionId }).catch((err) =>
@@ -116,13 +128,119 @@ app.post('/api/human/end', (req, res) => {
 });
 
 // （调试用）直接触发转人工
-app.post('/api/human/transfer', (req, res) => {
+app.post('/api/human/transfer', async (req, res) => {
   const { sessionId } = req.body || {};
   if (!sessionId) {
     res.status(400).json({ error: 'sessionId 必填' });
     return;
   }
-  startHumanSession(sessionId);
+  await startHumanSession(sessionId);
+  res.json({ ok: true });
+});
+
+// ---------- 客服工作台 API ----------
+// 客服列表（support_human 表）
+app.get('/api/humans', async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT id, name, code, status FROM support_human ORDER BY id;`
+    );
+    res.json({ humans: rows });
+  } catch (err) {
+    console.error('[humans] 查询异常:', err);
+    res.status(500).json({ error: '客服列表查询失败' });
+  }
+});
+
+// 客服上/下岗（online=可接单 / offline=不接单）
+app.post('/api/humans/status', async (req, res) => {
+  const { agentId, status } = req.body || {};
+  if (!agentId || !['online', 'offline'].includes(status)) {
+    res.status(400).json({ error: 'agentId 与 status(online|offline) 必填' });
+    return;
+  }
+  try {
+    const { rowCount } = await pool.query(
+      `UPDATE support_human SET status = $2 WHERE id = $1;`,
+      [agentId, status]
+    );
+    res.json({ ok: rowCount > 0 });
+  } catch (err) {
+    console.error('[humans] 状态更新异常:', err);
+    res.status(500).json({ error: '状态更新失败' });
+  }
+});
+
+// 客服工作台长连接：新会话分配 / 用户新消息 / 会话结束
+app.get('/api/agent/events', (req, res) => {
+  const agentId = Number(req.query.agentId || 0);
+  if (!agentId) {
+    res.status(400).json({ error: 'agentId 必填' });
+    return;
+  }
+  res.writeHead(200, SSE_HEADERS);
+  res.write('retry: 2000\n\n');
+  const remove = addAgentChannel(agentId, res);
+  req.on('close', remove);
+});
+
+// 我（客服）名下进行中的人工会话列表
+app.get('/api/agent/sessions', async (req, res) => {
+  const agentId = Number(req.query.agentId || 0);
+  if (!agentId) {
+    res.status(400).json({ error: 'agentId 必填' });
+    return;
+  }
+  try {
+    const { rows } = await pool.query(
+      `SELECT s.session_id,
+              s.human_join_at     AS join_at,
+              s.human_updated_at  AS updated_at,
+              (SELECT m.content FROM chat_messages m
+                WHERE m.session_id = s.session_id ORDER BY m.id DESC LIMIT 1) AS last_message
+       FROM chat_sessions s
+       WHERE s.human_status = 'active' AND s.human_agent_id = $1
+       ORDER BY s.human_updated_at DESC;`,
+      [agentId]
+    );
+    res.json({ sessions: rows });
+  } catch (err) {
+    console.error('[agent/sessions] 查询异常:', err);
+    res.status(500).json({ error: '会话列表查询失败' });
+  }
+});
+
+// 客服回复用户：入库 + 经用户 SSE 实时送达
+app.post('/api/agent/message', async (req, res) => {
+  const { agentId, sessionId, text } = req.body || {};
+  if (!agentId || !sessionId || !String(text || '').trim()) {
+    res.status(400).json({ error: 'agentId、sessionId 与 text 必填' });
+    return;
+  }
+  try {
+    const r = await agentReply({ agentId: Number(agentId), sessionId, text: String(text).trim() });
+    if (!r.ok) {
+      res.status(409).json({ error: r.error });
+      return;
+    }
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('[agent/message] 处理异常:', err);
+    res.status(500).json({ error: '消息发送失败' });
+  }
+});
+
+// 客服侧结束会话
+app.post('/api/agent/end', async (req, res) => {
+  const { agentId, sessionId } = req.body || {};
+  if (!agentId || !sessionId) {
+    res.status(400).json({ error: 'agentId 与 sessionId 必填' });
+    return;
+  }
+  const saved = await store.getHumanState(sessionId);
+  if (saved?.status === 'active' && saved?.agent?.id === Number(agentId)) {
+    await endHumanSession(sessionId);
+  }
   res.json({ ok: true });
 });
 
@@ -155,6 +273,15 @@ app.post('/api/memory/forget', (req, res) => {
 });
 
 const PORT = Number(process.env.PORT) || 3000;
-app.listen(PORT, () => {
-  console.log(`[物流智能客服 demo] 已启动: http://localhost:${PORT}`);
-});
+
+// 启动前先完成建表（chat_sessions / chat_messages / support_human）与种子客服
+initDb()
+  .then(() => {
+    app.listen(PORT, () => {
+      console.log(`[物流智能客服 demo] 已启动: http://localhost:${PORT}`);
+    });
+  })
+  .catch((err) => {
+    console.error('[db] PostgreSQL 初始化失败，服务未启动:', err.message);
+    process.exit(1);
+  });

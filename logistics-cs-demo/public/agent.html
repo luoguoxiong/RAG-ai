@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>小邮 · 人工客服工作台</title>
+  <link rel="icon" href="data:," />
+  <link rel="stylesheet" href="./style.css" />
+  <link rel="stylesheet" href="./agent.css" />
+</head>
+<body>
+  <div class="app agent-app">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-logo brand-logo-orange">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+        </div>
+        <div class="brand-text">
+          <div class="brand-name">人工客服工作台</div>
+          <div class="brand-sub">物流智能客服 Demo</div>
+        </div>
+      </div>
+
+      <!-- 未上岗：客服列表 -->
+      <div id="loginView">
+        <div class="section-title">客服列表 · 选择身份上岗</div>
+        <div id="humanList" class="human-list">
+          <div class="human-loading">加载中…</div>
+        </div>
+      </div>
+
+      <!-- 已上岗：我的会话列表 -->
+      <div id="workView" class="hidden">
+        <div class="section-title">我的会话 <span id="convCount" class="conv-count"></span></div>
+        <div id="sessionList" class="conv-list"></div>
+        <div id="convEmpty" class="conv-empty">暂无进行中的会话<br /><small>用户在聊天页"转人工"后会自动分配给您</small></div>
+      </div>
+
+      <div class="sidebar-foot">
+        <span class="dot" id="connDot"></span>
+        <span id="connText">未连接</span>
+        <button id="offlineBtn" class="ghost ghost-blue ghost-mini hidden">下岗</button>
+      </div>
+    </aside>
+
+    <main class="chat">
+      <header class="chat-head">
+        <div class="head-text">
+          <h1 id="convTitle">人工客服工作台</h1>
+          <p id="agentInfoText">从左侧客服列表选择身份上岗后开始接单</p>
+        </div>
+        <div class="head-actions">
+          <a href="./index.html" class="ghost ghost-blue" target="_blank">用户端演示页</a>
+          <button id="endConvBtn" class="ghost hidden">结束会话</button>
+        </div>
+      </header>
+
+      <div id="convBanner" class="banner hidden"></div>
+
+      <div class="messages" id="messages">
+        <div class="agent-empty">
+          <div class="agent-empty-ic">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+          </div>
+          <h3>等待接入会话</h3>
+          <p>上岗后，用户在聊天页点击"转人工"，会话将自动分配给您。<br />选择左侧会话即可回复用户，回复会实时送达用户页面。</p>
+        </div>
+      </div>
+
+      <footer class="composer">
+        <textarea id="input" rows="1" placeholder="选择会话后输入回复，Enter 发送，Shift+Enter 换行" disabled></textarea>
+        <button id="sendBtn" disabled aria-label="发送">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M22 2L11 13"/><path d="M22 2l-7 20-4-9-9-4 20-7z"/></svg>
+        </button>
+      </footer>
+    </main>
+  </div>
+
+  <script src="./agent.js"></script>
+</body>
+</html>
