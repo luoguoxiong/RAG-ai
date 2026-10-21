@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>小邮 · 物流智能客服 Demo</title>
+  <link rel="icon" href="data:," />
+  <link rel="stylesheet" href="./style.css" />
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-logo">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M1 4h14v12H1z"/><path d="M15 9h4l3 3v4h-7V9z"/><circle cx="6" cy="19" r="2"/><circle cx="18" cy="19" r="2"/></svg>
+        </div>
+        <div class="brand-text">
+          <div class="brand-name">小邮智能客服</div>
+          <div class="brand-sub">DeepSeek · LangChain</div>
+        </div>
+      </div>
+
+      <div class="section-title">AGENT 能力</div>
+      <ul class="caps">
+        <li>
+          <span class="cap-ic c-blue"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg></span>
+          <div><b>知识库查询</b><small>禁运品 / 包装 / 理赔 / 保价</small></div>
+        </li>
+        <li>
+          <span class="cap-ic c-violet"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 8l-9-5-9 5v8l9 5 9-5V8z"/><path d="M3 8l9 5 9-5"/><path d="M12 13v8"/></svg></span>
+          <div><b>运单状态查询</b><small>轨迹 / 预计送达 / 异常</small></div>
+        </li>
+        <li>
+          <span class="cap-ic c-amber"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 21c4-4.5 7-8 7-11a7 7 0 1 0-14 0c0 3 3 6.5 7 11z"/><circle cx="12" cy="10" r="2.5"/></svg></span>
+          <div><b>运费与时效</b><small>按线路与重量估价</small></div>
+        </li>
+        <li>
+          <span class="cap-ic c-orange"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 13a8 8 0 0 1 16 0"/><rect x="2.5" y="13" width="4.5" height="6.5" rx="2"/><rect x="17" y="13" width="4.5" height="6.5" rx="2"/></svg></span>
+          <div><b>转接人工</b><small>排队接入 mock 客服</small></div>
+        </li>
+      </ul>
+
+      <div class="section-title">快捷提问</div>
+      <div class="quick" id="quickList">
+        <button>运单 SF1234567890 到哪了？</button>
+        <button>寄 10kg 到北京多少钱？多久能到？</button>
+        <button>哪些物品不能寄？</button>
+        <button>包裹丢了怎么理赔？</button>
+        <button>转人工</button>
+      </div>
+
+      <div class="sidebar-foot">
+        <span class="dot" id="connDot"></span>
+        <span id="connText">连接中…</span>
+        <span class="session" id="sessionShort"></span>
+      </div>
+    </aside>
+    <main class="chat">
+      <header class="chat-head">
+        <div class="head-text">
+          <h1>物流智能客服</h1>
+          <p id="modeText">智能客服模式 · Mock 数据演示</p>
+        </div>
+        <button id="endHumanBtn" class="ghost hidden">结束人工会话</button>
+      </header>
+
+      <div id="banner" class="banner hidden"></div>
+
+      <div class="messages" id="messages"></div>
+
+      <div id="humanTyping" class="human-typing hidden">
+        <span class="dots-mini"><i></i><i></i><i></i></span> 人工客服正在输入…
+      </div>
+
+      <footer class="composer">
+        <button id="transferBtn" class="transfer-btn" title="转接人工客服">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 13a8 8 0 0 1 16 0"/><rect x="2.5" y="13" width="4.5" height="6.5" rx="2"/><rect x="17" y="13" width="4.5" height="6.5" rx="2"/></svg>
+          <span>转人工</span>
+        </button>
+        <textarea id="input" rows="1" placeholder="请输入您的问题，Enter 发送，Shift+Enter 换行"></textarea>
+        <button id="sendBtn" disabled aria-label="发送">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M22 2L11 13"/><path d="M22 2l-7 20-4-9-9-4 20-7z"/></svg>
+        </button>
+      </footer>
+    </main>
+  </div>
+  <script src="./app.js"></script>
+</body>
+</html>
