@@ -5,7 +5,7 @@ import express from 'express';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { initDb, pool } from './db.js';
-import { handleAgentMessage } from './agent.js';
+import { handleAgentMessage, handleSlotSubmit, hasPendingSlots, getCityOptions } from './agent.js';
 import {
   addChannel,
   addAgentChannel,
@@ -73,6 +73,36 @@ app.post('/api/chat', async (req, res) => {
     send('error', { message: err?.message || '服务处理异常，请稍后重试' });
   }
   res.end();
+});
+
+// 意图识别槽位补全：LLM 识别意图但缺城市参数时挂起，前端弹窗选地址后提交至此恢复执行
+// 挂起校验放在进入 SSE 前，业务拒绝可直接返回 JSON 状态码
+app.post('/api/chat/slots', async (req, res) => {
+  const { sessionId, intent, slots, userId } = req.body || {};
+  if (!sessionId || !intent) {
+    res.status(400).json({ error: 'sessionId 与 intent 必填' });
+    return;
+  }
+  if (!hasPendingSlots(sessionId, intent)) {
+    res.status(409).json({ error: 'no_pending_slots', message: '没有待补充的查询，请重新描述您的需求' });
+    return;
+  }
+
+  res.writeHead(200, SSE_HEADERS);
+  const send = (event, data) => res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+  send('start', { ts: Date.now() });
+  try {
+    await handleSlotSubmit({ sessionId, intent, slots: slots || {}, userId: userId ? String(userId) : '', send });
+  } catch (err) {
+    console.error('[slots] 处理异常:', err);
+    send('error', { message: err?.message || '服务处理异常，请稍后重试' });
+  }
+  res.end();
+});
+
+// 地址选择弹窗下拉数据源（与 Mock 数据单一来源）
+app.get('/api/cities', (req, res) => {
+  res.json(getCityOptions());
 });
 
 // 历史对话查询（PostgreSQL 持久化）

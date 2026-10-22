@@ -129,6 +129,30 @@ export const FREIGHT_PRODUCTS = [
   { name: '经济', first: 8, additional: 2, eta: { city: '2-3天', intra: '2-3天', cross: '3-5天', remote: '5-7天' } }
 ];
 
+// 网点 Mock 数据（营业点/自提点，services 为可办业务）
+export const BRANCHES = [
+  // 杭州
+  { id: 'B001', name: '杭州滨江网服小镇营业点', city: '杭州', district: '滨江区', address: '滨江区江南大道 588 号中赢国际 1 幢 101', landmark: '江南大道地铁站 B 口旁', phone: '0571-86660001', hours: '08:30-20:00', services: ['寄件', '自提', '保价', '大件收寄'] },
+  { id: 'B002', name: '杭州西湖文三路营业点', city: '杭州', district: '西湖区', address: '西湖区文三路 477 号华星世纪大厦 1 层', landmark: '近黄龙体育中心', phone: '0571-86660002', hours: '09:00-19:00', services: ['寄件', '自提', '保价'] },
+  { id: 'B003', name: '杭州钱江新城自助柜', city: '杭州', district: '上城区', address: '上城区富春路 701 号市民中心北广场', landmark: '市民中心地铁站 C 口', phone: '0571-86660003', hours: '24 小时自助', services: ['自提', '寄存'] },
+  // 北京
+  { id: 'B010', name: '北京朝阳大悦城营业点', city: '北京', district: '朝阳区', address: '朝阳区朝阳北路 101 号大悦城写字楼 3 层', landmark: '青年路站 D 口', phone: '010-85860001', hours: '08:30-20:00', services: ['寄件', '自提', '保价', '大件收寄'] },
+  { id: 'B011', name: '北京海淀中关村营业点', city: '北京', district: '海淀区', address: '海淀区中关村大街 27 号 1 层', landmark: '中关村地铁站 A 口', phone: '010-85860002', hours: '09:00-19:30', services: ['寄件', '自提', '保价', '冷链'] },
+  { id: 'B012', name: '北京丰台科技园自提点', city: '北京', district: '丰台区', address: '丰台区丰台北路 18 号金唐中心 A 座底商', landmark: '丰台科技园站 B 口', phone: '010-85860003', hours: '24 小时自助', services: ['自提'] },
+  // 上海
+  { id: 'B020', name: '上海浦东陆家嘴营业点', city: '上海', district: '浦东新区', address: '浦东新区浦东南路 999 号 1 层', landmark: '东昌路地铁站 2 号口', phone: '021-68860001', hours: '08:30-20:00', services: ['寄件', '自提', '保价'] },
+  { id: 'B021', name: '上海徐汇漕河泾营业点', city: '上海', district: '徐汇区', address: '徐汇区宜山路 900 号 A 楼底商', landmark: '漕河泾开发区站', phone: '021-68860002', hours: '09:00-19:00', services: ['寄件', '自提', '大件收寄', '冷链'] },
+  // 广州 / 深圳
+  { id: 'B030', name: '广州天河体育西营业点', city: '广州', district: '天河区', address: '天河区体育西路 103 号维多利广场首层', landmark: '体育西路站 A 口', phone: '020-38860001', hours: '08:30-20:00', services: ['寄件', '自提', '保价'] },
+  { id: 'B031', name: '深圳南山科技园营业点', city: '深圳', district: '南山区', address: '南山区科技南十二路 18 号 1 层', landmark: '深大地铁站 C 口', phone: '0755-86660001', hours: '08:30-20:30', services: ['寄件', '自提', '保价', '大件收寄'] },
+  { id: 'B032', name: '深圳福田车公庙自提柜', city: '深圳', district: '福田区', address: '福田区泰然九路 21 栋 1 层', landmark: '车公庙地铁站 F 口', phone: '0755-86660002', hours: '24 小时自助', services: ['自提', '寄存'] },
+  // 成都 / 武汉 / 西安 / 济南
+  { id: 'B040', name: '成都高新区天府三街营业点', city: '成都', district: '武侯区', address: '高新区天府三街 199 号 1 层', landmark: '天府三街站 A 口', phone: '028-86660001', hours: '09:00-19:00', services: ['寄件', '自提', '冷链'] },
+  { id: 'B050', name: '武汉光谷广场营业点', city: '武汉', district: '洪山区', address: '洪山区珞喻路 726 号 1 层', landmark: '光谷广场地铁站', phone: '027-86660001', hours: '08:30-20:00', services: ['寄件', '自提', '保价'] },
+  { id: 'B060', name: '西安雁塔小寨营业点', city: '西安', district: '雁塔区', address: '雁塔区小寨西路 232 号 1 层', landmark: '小寨地铁站 C 口', phone: '029-86660001', hours: '09:00-19:30', services: ['寄件', '自提', '保价', '大件收寄'] },
+  { id: 'B070', name: '济南历下泉城路营业点', city: '济南', district: '历下区', address: '历下区泉城路 180 号 1 层', landmark: '近恒隆广场', phone: '0531-86660001', hours: '09:00-19:00', services: ['寄件', '自提'] }
+];
+
 // 城市 -> 省份（含直辖市/省份本身，用于线路识别）
 const rawCities = {
   '北京': '北京', '上海': '上海', '天津': '天津', '重庆': '重庆',
@@ -158,3 +182,9 @@ export const CITY_INFO = Object.fromEntries([
 
 // 偏远省份（运费上浮、时效增加）
 export const REMOTE_PROVINCES = new Set(['新疆', '西藏', '内蒙古', '青海', '甘肃', '宁夏', '黑龙江', '吉林', '辽宁']);
+
+// ---------- 前端地址选择弹窗数据源 ----------
+// 支持计价的城市（寄出/目的地下拉）
+export const CITY_LIST = Object.keys(rawCities);
+// 有网点的城市（网点查询弹窗下拉）
+export const BRANCH_CITIES = [...new Set(BRANCHES.map((b) => b.city))];

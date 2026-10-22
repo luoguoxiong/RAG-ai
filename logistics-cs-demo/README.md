@@ -4,11 +4,12 @@
 
 ## 功能
 
-LLM（deepseek-chat）根据用户问题自主决策，调用 4 个工具：
+LLM（deepseek-chat）根据用户问题自主决策，调用 5 个工具：
 
 - **query_shipment**：查运单状态（轨迹 / 预计送达 / 派送员 / 异常提示）— Mock 运单
 - **query_freight**：估算运费时效（同城 / 省内 / 跨省 / 偏远 线路系数，三档产品）— Mock 计价引擎
 - **query_knowledge**：寄递知识库检索（禁运品 / 包装 / 理赔 / 保价等 8 篇）— 关键词打分检索
+- **query_branches**：网点查询（按城市 / 区县 / 省份检索营业点与自提点，支持按区县、地标、业务类型筛选）— Mock 网点数据
 - **transfer_human**：转接人工（排队 -> 客服接入 -> 真人回复 -> 结束）— 会话级 SSE 推送
 
 - **人工客服工作台**（`/agent.html`）：从 `support_human` 客服列表选择身份上岗，会话自动分配、用户消息实时推送，客服真人回复经 SSE 实时送达用户页面；客服工作台离线时消息照常入库并提示用户已记录，等待客服上线处理（不做任何自动应答）
@@ -17,6 +18,7 @@ LLM（deepseek-chat）根据用户问题自主决策，调用 4 个工具：
 - 支持**多轮对话记忆**：第二轮"那换成 5 公斤呢？"会自动继承上一轮的城市上下文
 - Agent 过程（思考 -> 决定调用工具 -> 工具结果 -> 回复）以"过程徽章"实时展示，回复逐 token 流式输出
 - 未提供运单号/目的地时，LLM 会先追问而不是瞎调工具
+- **意图识别 + 槽位补全弹窗**：LLM 识别出查运费/查网点意图但缺城市参数时，服务端挂起本轮并推送 `ask_location` 事件，前端**弹窗选择地址**（寄出城市自动预填长期记忆的常用城市）后提交 `POST /api/chat/slots` 恢复执行——直接调工具 + 结果交 LLM 生成回答，替代纯文字追问
 - **长期记忆**：跨会话记住用户画像与偏好（常用寄出城市、业务身份、偏好档位等），带完整的更新策略（置信度合并、冲突消解、时间衰减、用户纠正、可遗忘）—— 设计详见 [docs/long-term-memory-design.md](docs/long-term-memory-design.md)
 
 ## 运行
@@ -48,9 +50,11 @@ createdb logistics_cs   # 或: psql -c "CREATE DATABASE logistics_cs;"
 | 查运单 | `运单 SF1234567890 到哪了？`（演示单号：SF1234567890 / JD1008612345 / YT9876543210 / YD7788990011） |
 | 查运费时效 | `寄 10kg 到北京多少钱？多久能到？`、`从广州寄20斤到成都几天到`、`那换成5公斤呢？` |
 | 查知识库 | `充电宝可以寄吗？`、`包裹丢了怎么理赔？` |
+| 查网点 | `杭州滨江有营业网点吗？`、`深圳哪里有 24 小时自提点？`、`浙江有哪些网点？`（未说城市 LLM 先追问） |
 | 转人工 | `我要投诉，转人工` -> 排队约 4 秒接入 -> 试试 `我的件丢了` / `改地址` |
 | 多需求 | `帮我查下 SF1234567890，顺便看看什么不能寄`（一次调用两个工具） |
 | 缺信息追问 | `我的快递到哪了`（LLM 先追问运单号） |
+| 槽位补全弹窗 | `帮我查下运费`（识别出查运费意图但无城市 → 弹窗选地址 → 提交后自动查询出结果）、`帮我查下网点`（弹窗选城市）；关掉弹窗则回退为文字追问 |
 | 长期记忆 | 会话 A 说 `我常从杭州发货` -> 点右上角"**新会话**" -> 直接问 `寄 10kg 到北京多少钱？`（自动带出杭州，徽章显示"参考记忆"）；纠正用 `不对，我搬到深圳了`（记忆更新、旧值归档）；右上角"**我的记忆**"面板可查看每条的置信度/依据并单条删除或"忘记我" |
 
 ## 架构
@@ -68,12 +72,12 @@ server/
   db.js                   PostgreSQL 连接池 + 建表 + 种子客服
   agent.js               LangChain Agent：bindTools + 流式工具调用循环 + 会话记忆
   llm.js                 ChatDeepSeek 封装（读取 .env，temperature 可覆盖）
-  tools.js               业务工具实现（运单/运费/知识库）+ scoreKnowledge
+  tools.js               业务工具实现（运单/运费/知识库/网点）+ scoreKnowledge
   session.js             会话级 SSE 通道 + 人工客服会话管理（排队/接入/应答，状态持久化、重启可恢复）
   store.js               PostgreSQL 持久层：对话历史 + 人工会话状态存取（chat_sessions / chat_messages）
   memory.js              长期记忆：LLM 异步提取 + 合并更新策略 + 检索注入 + 会话摘要
   memstore.js            记忆持久层：用户画像事实 + 会话摘要（data/memory.json，原子写）
-  data.js                Mock 数据：知识库 / 运单 / 运费产品 / 城市线路
+  data.js                Mock 数据：知识库 / 运单 / 运费产品 / 网点 / 城市线路
 data/
   memory.json            长期记忆持久化文件（运行时生成，已 gitignore）
 ```
@@ -99,6 +103,7 @@ Agent 循环（`agent.js`）：`system prompt + history + user` -> `llm.bindTool
 | `start` | `{ts}` | 流开始 |
 | `status` | `{step,label,detail,state}` | 过程徽章：`llm_N`（思考/决策）、`tool_N`（工具调用与结果） |
 | `delta` | `{text}` | LLM 输出增量 token |
+| `ask_location` | `{intent,missing,originMemory,preset}` | 意图已识别但缺城市槽位：前端弹窗选地址（`originMemory` 为记忆中的常用寄出城市，用于预填） |
 | `memory_used` | `{label,value}` | 本轮回答参考了长期记忆（如运费估算兜底常用寄出城市） |
 | `done` | `{intent,mode}` | 本轮结束 |
 | `error` | `{message}` | 服务异常（含 DeepSeek 配置错误） |
@@ -115,7 +120,7 @@ Agent 循环（`agent.js`）：`system prompt + history + user` -> `llm.bindTool
 | `human_ended` | `{}` | 会话结束，切回智能客服 |
 | `memory_saved` | `{action,label,value}` | 长期记忆提取结果通知：`created`/`updated`/`deleted`（提取异步去抖执行，回复结束后数秒才推送） |
 
-其他接口：`GET /api/history?sessionId=`（拉取历史对话，前端刷新后回显）、`POST /api/human/message`（人工模式发消息）、`POST /api/human/end`（结束会话）、`POST /api/human/transfer`（调试直触转人工）、`GET /api/memory?userId=`（记忆面板数据）、`DELETE /api/memory/:userId/facts/:factId`（删除单条记忆）、`POST /api/memory/forget`（忘记我，清空全部）。
+其他接口：`GET /api/history?sessionId=`（拉取历史对话，前端刷新后回显）、`POST /api/chat/slots`（槽位补全提交：弹窗选完地址后恢复查询，SSE 流式协议同 `/api/chat`）、`GET /api/cities`（地址弹窗下拉数据源：计价城市 / 网点覆盖城市）、`POST /api/human/message`（人工模式发消息）、`POST /api/human/end`（结束会话）、`POST /api/human/transfer`（调试直触转人工）、`GET /api/memory?userId=`（记忆面板数据）、`DELETE /api/memory/:userId/facts/:factId`（删除单条记忆）、`POST /api/memory/forget`（忘记我，清空全部）。
 
 ### 3) 客服工作台（`/agent.html`）
 
@@ -132,6 +137,6 @@ Agent 循环（`agent.js`）：`system prompt + history + user` -> `llm.bindTool
 
 ## 替换为真实业务
 
-- `tools.js`：把 mock 实现换成真实轨迹 API、计价引擎、向量检索（RAG）；工具签名（zod schema）不变，LLM 侧无需改动
+- `tools.js`：把 mock 实现换成真实轨迹 API、计价引擎、向量检索（RAG）、网点目录服务（POI）；工具签名（zod schema）不变，LLM 侧无需改动
 - `llm.js`：更换模型只需改 `DEEPSEEK_MODEL`，或把 ChatDeepSeek 换成其他 ChatModel
 - `session.js`：人工客服替换为真实客服工单系统（WebSocket / IM 网关）

@@ -35,6 +35,10 @@
           <div><b>运费与时效</b><small>按线路与重量估价</small></div>
         </li>
         <li>
+          <span class="cap-ic c-cyan"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 9l9-6 9 6v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V9z"/><path d="M9 21V12h6v9"/><path d="M9 16h6"/></svg></span>
+          <div><b>网点查询</b><small>营业点 / 自提点位置与业务</small></div>
+        </li>
+        <li>
           <span class="cap-ic c-orange"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 13a8 8 0 0 1 16 0"/><rect x="2.5" y="13" width="4.5" height="6.5" rx="2"/><rect x="17" y="13" width="4.5" height="6.5" rx="2"/></svg></span>
           <div><b>转接人工</b><small>排队接入 mock 客服</small></div>
         </li>
@@ -49,6 +53,7 @@
         <button>运单 SF1234567890 到哪了？</button>
         <button>寄 10kg 到北京多少钱？多久能到？</button>
         <button>哪些物品不能寄？</button>
+        <button>杭州滨江有营业网点吗？</button>
         <button>包裹丢了怎么理赔？</button>
         <button>转人工</button>
       </div>
@@ -115,6 +120,49 @@
         <div id="memoryFacts" class="fact-list"></div>
         <div id="memorySummaries" class="summary-list"></div>
         <div id="memoryEmpty" class="memory-empty hidden">暂无长期记忆。和我多聊几句，比如"我常从杭州发货"，我会记住并在新会话中使用。</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 地址选择弹窗（意图识别缺城市槽位时弹出） -->
+  <div id="slotPanel" class="panel-mask hidden">
+    <div class="panel slot-panel" role="dialog" aria-label="选择地址">
+      <div class="panel-head">
+        <div>
+          <h2 id="slotTitle">选择地址</h2>
+          <p class="panel-sub" id="slotSub">请补充城市信息后继续查询</p>
+        </div>
+        <div class="panel-actions">
+          <button id="slotCloseBtn" class="panel-close" aria-label="关闭">&times;</button>
+        </div>
+      </div>
+      <div class="panel-body">
+        <div id="slotFreightForm" class="slot-form hidden">
+          <label class="slot-field">
+            <span>寄出城市</span>
+            <select id="slotOrigin"></select>
+          </label>
+          <label class="slot-field">
+            <span>目的城市 <i class="req">*</i></span>
+            <select id="slotDest"><option value="">请选择</option></select>
+          </label>
+          <label class="slot-field slot-half">
+            <span>重量（kg）</span>
+            <input id="slotWeight" type="number" min="0.1" step="0.5" value="1" />
+          </label>
+        </div>
+        <div id="slotBranchForm" class="slot-form hidden">
+          <label class="slot-field">
+            <span>城市 <i class="req">*</i></span>
+            <select id="slotCity"><option value="">请选择</option></select>
+          </label>
+          <label class="slot-field">
+            <span>筛选关键词（可选）</span>
+            <input id="slotKeyword" placeholder="区县 / 地标 / 自提、大件、冷链" />
+          </label>
+        </div>
+        <p id="slotHint" class="slot-hint"></p>
+        <button id="slotSubmitBtn" class="slot-submit">开始查询</button>
       </div>
     </div>
   </div>

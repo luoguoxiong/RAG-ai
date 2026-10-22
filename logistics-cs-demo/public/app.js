@@ -225,6 +225,40 @@ function parseSSE(raw) {
   return { event, data: dataLines.join('\n') };
 }
 
+// 请求级 SSE 通用读取：聊天与槽位补全提交共用
+async function streamAgentReply(url, body, { traceEl, bubble, ctx }) {
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
+  });
+  if (!res.ok) {
+    let msg = `请求失败（HTTP ${res.status}）`;
+    try {
+      const j = await res.json();
+      if (j.message) msg = j.message;
+    } catch { /* ignore */ }
+    throw new Error(msg);
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = '';
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    let idx;
+    while ((idx = buf.indexOf('\n\n')) >= 0) {
+      const raw = buf.slice(0, idx);
+      buf = buf.slice(idx + 2);
+      const { event, data } = parseSSE(raw);
+      if (!data) continue;
+      handleStreamEvent(event, JSON.parse(data), { traceEl, bubble, ctx });
+    }
+  }
+}
+
 async function sendMessage(text) {
   text = (text || '').trim();
   if (!text) return;
@@ -237,36 +271,11 @@ async function sendMessage(text) {
   const ctx = { text: '' };
   const { traceEl, bubble } = createAgentMessage();
   try {
-    const res = await fetch('/api/chat', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ sessionId: state.sessionId, message: text, userId: state.userId })
-    });
-    if (!res.ok) {
-      let msg = `请求失败（HTTP ${res.status}）`;
-      try {
-        const j = await res.json();
-        if (j.message) msg = j.message;
-      } catch { /* ignore */ }
-      throw new Error(msg);
-    }
-
-    const reader = res.body.getReader();
-    const decoder = new TextDecoder();
-    let buf = '';
-    for (;;) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      buf += decoder.decode(value, { stream: true });
-      let idx;
-      while ((idx = buf.indexOf('\n\n')) >= 0) {
-        const raw = buf.slice(0, idx);
-        buf = buf.slice(idx + 2);
-        const { event, data } = parseSSE(raw);
-        if (!data) continue;
-        handleStreamEvent(event, JSON.parse(data), { traceEl, bubble, ctx });
-      }
-    }
+    await streamAgentReply(
+      '/api/chat',
+      { sessionId: state.sessionId, message: text, userId: state.userId },
+      { traceEl, bubble, ctx }
+    );
   } catch (err) {
     bubble.innerHTML = md(`抱歉，请求出现异常：${err.message}。请稍后重试，或输入"转人工"。`);
   } finally {
@@ -289,6 +298,10 @@ function handleStreamEvent(event, data, { traceEl, bubble, ctx }) {
       label: `参考记忆 · ${data.label}：${data.value}`,
       state: 'done'
     });
+  } else if (event === 'ask_location') {
+    // 意图已识别但缺城市参数：弹窗让用户选地址，提交后自动恢复查询
+    bubble.innerHTML = md('我已识别您的需求，但还差一些地址信息，请在弹窗中补充 👇');
+    openSlotPanel(data, { traceEl, bubble });
   } else if (event === 'done') {
     bubble.innerHTML = md(ctx.text);
   } else if (event === 'error') {
@@ -529,6 +542,146 @@ memoryFactsEl.addEventListener('click', async (e) => {
   } catch { /* ignore */ }
 });
 
+/* ---------- 地址选择弹窗（意图识别槽位补全） ---------- */
+const slotPanelEl = $('#slotPanel');
+const slotTitleEl = $('#slotTitle');
+const slotSubEl = $('#slotSub');
+const slotFreightFormEl = $('#slotFreightForm');
+const slotBranchFormEl = $('#slotBranchForm');
+const slotOriginEl = $('#slotOrigin');
+const slotDestEl = $('#slotDest');
+const slotWeightEl = $('#slotWeight');
+const slotCityEl = $('#slotCity');
+const slotKeywordEl = $('#slotKeyword');
+const slotHintEl = $('#slotHint');
+const slotSubmitBtn = $('#slotSubmitBtn');
+
+const cityOptions = { freight: null, branch: null };
+let slotIntent = null; // 当前弹窗意图：query_freight | query_branches
+let slotCtx = null; // 弹窗对应的回复气泡（取消时用于回写提示）
+
+function fillSelect(selectEl, cities, placeholder) {
+  selectEl.innerHTML =
+    `<option value="">${escapeHtml(placeholder)}</option>` +
+    cities.map((c) => `<option value="${escapeHtml(c)}">${escapeHtml(c)}</option>`).join('');
+}
+
+async function ensureCityOptions(kind) {
+  if (cityOptions[kind]) return cityOptions[kind];
+  const res = await fetch('/api/cities');
+  if (!res.ok) throw new Error('城市列表加载失败');
+  const data = await res.json();
+  cityOptions.freight = data.freightCities || [];
+  cityOptions.branch = data.branchCities || [];
+  return cityOptions[kind];
+}
+
+async function openSlotPanel(ask, ctx) {
+  slotIntent = ask.intent;
+  slotCtx = ctx;
+  slotHintEl.textContent = '';
+  slotFreightFormEl.classList.toggle('hidden', ask.intent !== 'query_freight');
+  slotBranchFormEl.classList.toggle('hidden', ask.intent !== 'query_branches');
+
+  if (ask.intent === 'query_freight') {
+    slotTitleEl.textContent = '选择寄递地址';
+    slotSubEl.textContent = '需要确认寄出与目的城市后才能估算运费时效';
+    slotWeightEl.value = ask.preset?.weightKg || 1;
+    slotDestEl.innerHTML = '<option value="">请选择</option>';
+  } else {
+    slotTitleEl.textContent = '选择查询城市';
+    slotSubEl.textContent = '需要确认城市后才能查询营业网点';
+    slotKeywordEl.value = ask.preset?.keyword || '';
+    slotCityEl.innerHTML = '<option value="">请选择</option>';
+  }
+  slotSubmitBtn.disabled = true;
+  slotHintEl.textContent = '城市列表加载中…';
+  slotPanelEl.classList.remove('hidden');
+
+  try {
+    const kind = ask.intent === 'query_freight' ? 'freight' : 'branch';
+    const cities = await ensureCityOptions(kind);
+    if (ask.intent === 'query_freight') {
+      fillSelect(slotOriginEl, cities, '请选择');
+      fillSelect(slotDestEl, cities, '请选择');
+      // 预填优先级：本轮已识别的寄出城市 > 长期记忆常用寄出城市 > 默认杭州
+      const presetOrigin = ask.preset?.origin && cities.includes(ask.preset.origin) ? ask.preset.origin : null;
+      const memOrigin = ask.originMemory && cities.includes(ask.originMemory) ? ask.originMemory : null;
+      const origin = presetOrigin || memOrigin || '杭州';
+      slotOriginEl.value = origin;
+      slotHintEl.textContent = memOrigin && !presetOrigin ? `已根据记忆预填常用寄出城市「${memOrigin}」，可修改` : '';
+    } else {
+      fillSelect(slotCityEl, cities, '请选择');
+      slotHintEl.textContent = '';
+    }
+    slotSubmitBtn.disabled = false;
+  } catch (err) {
+    slotHintEl.textContent = `城市列表加载失败：${err.message}`;
+  }
+}
+
+function closeSlotPanel(cancelled) {
+  if (cancelled && slotCtx) {
+    slotCtx.bubble.innerHTML = md('已取消地址选择。您可以重新描述需求，或直接告诉我寄出/目的城市。');
+  }
+  slotPanelEl.classList.add('hidden');
+  slotIntent = null;
+  slotCtx = null;
+}
+
+async function submitSlots() {
+  if (!slotIntent || state.busy) return;
+  const slots = {};
+  if (slotIntent === 'query_freight') {
+    slots.origin = slotOriginEl.value || undefined;
+    slots.destination = slotDestEl.value;
+    slots.weightKg = Number(slotWeightEl.value) || 1;
+    if (!slots.destination) {
+      slotHintEl.textContent = '请先选择目的城市';
+      return;
+    }
+  } else {
+    slots.city = slotCityEl.value;
+    slots.keyword = slotKeywordEl.value.trim() || undefined;
+    if (!slots.city) {
+      slotHintEl.textContent = '请先选择城市';
+      return;
+    }
+  }
+
+  const intent = slotIntent;
+  const desc =
+    intent === 'query_freight'
+      ? `从 ${slots.origin || '杭州'} 寄到 ${slots.destination} · ${slots.weightKg}kg`
+      : `查询 ${slots.city} 的营业网点${slots.keyword ? `（${slots.keyword}）` : ''}`;
+  closeSlotPanel(false);
+
+  state.busy = true;
+  setInputEnabled(false);
+  addUserMessage(desc);
+
+  const ctx = { text: '' };
+  const { traceEl, bubble } = createAgentMessage();
+  try {
+    await streamAgentReply(
+      '/api/chat/slots',
+      { sessionId: state.sessionId, intent, slots, userId: state.userId },
+      { traceEl, bubble, ctx }
+    );
+  } catch (err) {
+    bubble.innerHTML = md(`提交失败：${err.message}。请重新描述您的需求。`);
+  } finally {
+    state.busy = false;
+    setInputEnabled(true);
+  }
+}
+
+slotSubmitBtn.addEventListener('click', submitSlots);
+$('#slotCloseBtn').addEventListener('click', () => closeSlotPanel(true));
+slotPanelEl.addEventListener('click', (e) => {
+  if (e.target === slotPanelEl) closeSlotPanel(true);
+});
+
 /* ---------- 初始化 ---------- */
 sessionShortEl.textContent = '会话 ' + state.sessionId.slice(0, 8);
 updateMode();
@@ -537,7 +690,7 @@ loadHistory().then((hasHistory) => {
   if (!hasHistory) {
     addMessage(
       'agent',
-      '您好，我是小邮，物流智能客服助手。您可以问我：\n1. 运单状态：如"运单 SF1234567890 到哪了"\n2. 运费时效：如"寄 10kg 到北京多少钱，几天能到"\n3. 寄递知识：如"哪些物品不能寄"、"理赔流程"\n也可以随时输入"转人工"转接人工客服。'
+      '您好，我是小邮，物流智能客服助手。您可以问我：\n1. 运单状态：如"运单 SF1234567890 到哪了"\n2. 运费时效：如"寄 10kg 到北京多少钱，几天能到"\n3. 寄递知识：如"哪些物品不能寄"、"理赔流程"\n4. 网点查询：如"杭州滨江有营业网点吗"、"附近哪里能寄大件"\n也可以随时输入"转人工"转接人工客服。'
     );
   }
 });

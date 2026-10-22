@@ -2,7 +2,8 @@
 import { tool } from '@langchain/core/tools';
 import { AIMessage, HumanMessage, SystemMessage, ToolMessage } from '@langchain/core/messages';
 import { z } from 'zod';
-import { queryShipment, queryFreight, queryKnowledge } from './tools.js';
+import { queryShipment, queryFreight, queryKnowledge, queryBranches } from './tools.js';
+import { CITY_LIST, BRANCH_CITIES } from './data.js';
 import { startHumanSession, isHumanActive } from './session.js';
 import { createLlm, DEEPSEEK_API_KEY } from './llm.js';
 import * as store from './store.js';
@@ -17,14 +18,16 @@ import {
 
 const MAX_ITERATIONS = 4; // 最多工具调用轮数
 const HISTORY_LIMIT = 20; // 构建 LLM 上下文时最多带的历史轮数
+const PENDING_SLOTS_TTL = 10 * 60 * 1000; // 槽位挂起有效期：超时后需重新提问
 
 const SYSTEM_PROMPT = `你是"小邮"，物流公司的智能客服助手，使用简体中文与用户交流。
 
 你可以调用以下工具：
 1. query_shipment —— 查询运单物流状态。仅当用户提供了运单号时调用；未提供时先礼貌询问运单号，不要调用。
-2. query_freight —— 估算运费与时效。从用户消息中抽取寄出城市、目的城市与重量（公斤）传入；重量未知传 1。只要目的地城市明确就立即调用（寄出城市未知可不传，系统会按默认城市估算并说明）；只有目的地城市也不明确时才先询问。
+2. query_freight —— 估算运费与时效。从用户消息中抽取寄出城市、目的城市与重量（公斤）传入；重量未知传 1。只要目的地城市明确就立即调用（寄出城市未知可不传，系统会按默认城市估算并说明）；用户想查运费/时效但**没有提到任何城市**时，不要用文字追问，直接调用本工具且不传城市参数，系统会引导用户通过地址选择弹窗补充。
 3. query_knowledge —— 检索寄递知识库，适用于禁运品、包装、理赔、保价、偏远地区、拒收退回、节假日、上门取件等政策类问题。
-4. transfer_human —— 用户要求转人工、找真人客服或投诉时，必须调用此工具。注意：只回复"正在为您转接"之类的文字而**不调用工具**是不允许的，那样用户永远等不到人工。即使历史对话里出现过仅文字回应的情况，也必须调用工具。
+4. query_branches —— 查询营业网点/自提点（地址、电话、营业时间、可办业务）。从用户消息中抽取城市与可选筛选条件（区县、地标、业务类型如自提/大件/冷链）传入；城市明确就立即调用；用户想查网点但**没说城市**时，不要用文字追问，直接调用本工具且不传 city，系统会引导用户通过地址选择弹窗补充。
+5. transfer_human —— 用户要求转人工、找真人客服或投诉时，必须调用此工具。注意：只回复"正在为您转接"之类的文字而**不调用工具**是不允许的，那样用户永远等不到人工。即使历史对话里出现过仅文字回应的情况，也必须调用工具。
 
 回答要求：
 - 基于工具返回的数据作答，严禁编造运单信息、价格或政策；未查到就如实告知。
@@ -38,6 +41,20 @@ const TRANSFER_REPLY = '好的，已为您发起转接人工客服的请求，�
 function isExplicitTransferRequest(message) {
   const stripped = String(message || '').replace(/[\s!！。？?~～，,]/g, '');
   return /^(转(接)?(个)?人工(客服)?|找(人工|真人)|真人客服|人工服务|我要(转人工|投诉)|投诉)$/.test(stripped);
+}
+
+// 确定性意图识别（快速路径）：运费/网点意图明确但消息不含任何已知城市 -> 直接弹窗补参。
+// LLM 提示词约束不可靠（实测 deepseek-chat 仍会文字追问），规则路径保证"缺城市必弹窗"体验；
+// 复杂表述（带上下文、口语化）仍由 LLM function calling 兜底（needMore 拦截同样会弹窗）。
+const BRANCH_INTENT_RE = /网点|营业点|门店|自提点|驿站|营业厅/;
+const FREIGHT_INTENT_RE =
+  /运费|邮费|快递费|多少钱|几块钱|怎么收费|价格|时效|几天到|多久到|几天能到|多久能到|寄东西|寄快递|发快递|寄件/;
+function detectCityIntent(message) {
+  const m = String(message || '');
+  if (CITY_LIST.some((c) => m.includes(c))) return null; // 含城市：交给 LLM 直接调工具
+  if (BRANCH_INTENT_RE.test(m)) return 'query_branches';
+  if (FREIGHT_INTENT_RE.test(m)) return 'query_freight';
+  return null;
 }
 
 // 从持久层加载对话历史（仅取用户/助手文本轮次）构建 LLM 上下文
@@ -146,6 +163,21 @@ function buildTools({ sessionId, userId, send }) {
     }
   );
 
+  const queryBranchesTool = tool(
+    async ({ city, keyword }) => {
+      const r = await queryBranches({ city, keyword });
+      return JSON.stringify(r);
+    },
+    {
+      name: 'query_branches',
+      description: '查询指定城市的营业网点/自提点（地址、电话、营业时间、可办业务，支持按区县、地标或业务类型如自提/大件/冷链筛选）。用户找网点、门店、自提点位置时调用。',
+      schema: z.object({
+        city: z.string().optional().describe('城市或区县名，如 杭州 / 滨江区；用户未说明则不传'),
+        keyword: z.string().optional().describe('筛选关键词，如 区县（滨江）、地标（地铁站）、业务（自提/大件/冷链/保价）')
+      })
+    }
+  );
+
   const transferHumanTool = tool(
     async () => {
       await startHumanSession(sessionId);
@@ -160,7 +192,7 @@ function buildTools({ sessionId, userId, send }) {
     }
   );
 
-  return [queryShipmentTool, queryFreightTool, queryKnowledgeTool, transferHumanTool];
+  return [queryShipmentTool, queryFreightTool, queryKnowledgeTool, queryBranchesTool, transferHumanTool];
 }
 
 // ---------- Agent 主流程：流式 + 工具调用循环 ----------
@@ -187,6 +219,26 @@ export async function handleAgentMessage({ sessionId, message, userId, send }) {
   const tools = buildTools({ sessionId, userId, send });
   const llmWithTools = llm.bindTools(tools);
   const toolMap = new Map(tools.map((t) => [t.name, t]));
+
+  // 确定性意图识别快速路径：意图明确但缺城市 -> 挂起并弹窗，不经 LLM
+  const fastIntent = detectCityIntent(message);
+  if (fastIntent) {
+    const memFact = recallFact(userId, 'attribute', 'origin_city');
+    setPendingSlots(sessionId, { intent: fastIntent, originalMessage: message, slots: {} });
+    send('status', {
+      step: 'intent',
+      label: `意图：${fastIntent === 'query_freight' ? '查运费时效（缺城市）' : '查网点（缺城市）'}`,
+      state: 'done'
+    });
+    send('ask_location', {
+      intent: fastIntent,
+      missing: fastIntent === 'query_freight' ? ['destination'] : ['city'],
+      originMemory: memFact ? factDisplay(memFact).value : null,
+      preset: {}
+    });
+    send('done', { intent: fastIntent, mode: 'slot_filling' });
+    return;
+  }
 
   // 长期记忆：把跨会话用户画像（L2）与最近会话摘要（L1）注入为独立 SystemMessage
   const memory = buildContext(userId);
@@ -231,6 +283,7 @@ export async function handleAgentMessage({ sessionId, message, userId, send }) {
     messages.push(new AIMessage({ content: textOf(agg?.content), tool_calls: toolCalls }));
 
     // 执行工具并把结果回填给模型
+    let slotAsk = null; // 槽位缺失：需要弹窗补参的意图
     for (const call of toolCalls) {
       const step = `tool_${toolCounter++}`;
       send('status', {
@@ -252,15 +305,43 @@ export async function handleAgentMessage({ sessionId, message, userId, send }) {
         }
       }
 
+      let parsed = null;
       let detail = '完成';
       try {
-        const parsed = JSON.parse(resultText);
+        parsed = JSON.parse(resultText);
         if (parsed?.summary) detail = parsed.summary;
         else if (parsed?.error) detail = `出错：${parsed.error}`;
       } catch { /* 非 JSON 结果 */ }
 
+      // 意图已识别但缺城市类槽位 -> 不让 LLM 文字追问，改为前端弹窗补参
+      if (parsed?.needMore) {
+        if (call.name === 'query_freight' && parsed.missing === 'destination') {
+          slotAsk = { intent: 'query_freight', slots: { ...call.args } };
+        } else if (call.name === 'query_branches' && parsed.missing === 'city') {
+          slotAsk = { intent: 'query_branches', slots: { ...call.args } };
+        }
+      }
+
       send('status', { step, label: `工具完成 · ${call.name}`, detail: truncate(detail, 60), state: 'done' });
-      messages.push(new ToolMessage({ content: resultText, tool_call_id: call.id }));
+      if (!slotAsk) messages.push(new ToolMessage({ content: resultText, tool_call_id: call.id }));
+    }
+
+    // 槽位补全：挂起本轮并通知前端弹窗，用户提交后经 /api/chat/slots 恢复执行
+    if (slotAsk) {
+      const memFact = recallFact(userId, 'attribute', 'origin_city');
+      setPendingSlots(sessionId, {
+        intent: slotAsk.intent,
+        originalMessage: message,
+        slots: slotAsk.slots
+      });
+      send('ask_location', {
+        intent: slotAsk.intent,
+        missing: slotAsk.intent === 'query_freight' ? ['destination'] : ['city'],
+        originMemory: memFact ? factDisplay(memFact).value : null,
+        preset: slotAsk.slots
+      });
+      send('done', { intent: slotAsk.intent, mode: 'slot_filling' });
+      return;
     }
   }
 
@@ -283,4 +364,103 @@ export async function handleAgentMessage({ sessionId, message, userId, send }) {
   }
 
   send('done', { intent: 'llm', mode: 'agent' });
+}
+
+// ---------- 槽位补全（弹窗选地址后恢复执行） ----------
+// 挂起状态仅存内存（弹窗为即时交互，服务重启丢失无妨），sessionId -> { intent, originalMessage, slots, createdAt }
+const pendingSlots = new Map();
+
+function setPendingSlots(sessionId, pending) {
+  pendingSlots.set(sessionId, { ...pending, createdAt: Date.now() });
+}
+
+// 只读探测：供路由在进入 SSE 前校验（返回 JSON 错误码）
+export function hasPendingSlots(sessionId, intent) {
+  const p = pendingSlots.get(sessionId);
+  return !!p && p.intent === intent && Date.now() - p.createdAt <= PENDING_SLOTS_TTL;
+}
+
+// 弹窗提交：直接调用对应工具 + 把结果交给 LLM 生成最终回答（单轮，不再进入工具循环）
+export async function handleSlotSubmit({ sessionId, intent, slots, userId, send }) {
+  const pending = pendingSlots.get(sessionId);
+  if (!pending || pending.intent !== intent) {
+    throw Object.assign(new Error('没有待补充的查询，请重新描述您的需求'), { status: 409 });
+  }
+  if (Date.now() - pending.createdAt > PENDING_SLOTS_TTL) {
+    pendingSlots.delete(sessionId);
+    throw Object.assign(new Error('选择已超时，请重新描述您的需求'), { status: 410 });
+  }
+  pendingSlots.delete(sessionId); // 原子取出，防重复提交
+
+  const s = slots || {};
+  const desc =
+    intent === 'query_freight'
+      ? `寄出城市 ${s.origin || '杭州'} → 目的地 ${s.destination}${s.weightKg ? `，重量 ${s.weightKg}kg` : ''}`
+      : `查询 ${s.city} 的营业网点${s.keyword ? `（筛选：${s.keyword}）` : ''}`;
+
+  send('status', { step: 'slots', label: '已收到地址选择', detail: truncate(desc, 40), state: 'done' });
+  send('status', { step: 'tool_resume', label: `调用工具 · ${intent}`, state: 'active' });
+
+  let result;
+  if (intent === 'query_freight') {
+    result = await queryFreight({
+      origin: s.origin,
+      destination: s.destination,
+      weightKg: Number(s.weightKg) || 1
+    });
+  } else {
+    result = await queryBranches({ city: s.city, keyword: s.keyword });
+  }
+  send('status', {
+    step: 'tool_resume',
+    label: `工具完成 · ${intent}`,
+    detail: truncate(result.summary || '完成', 60),
+    state: 'done'
+  });
+
+  // 先取历史（不含本次选择），再落库合并消息，避免 LLM 上下文出现重复
+  const history = await buildHistoryMessages(sessionId);
+  await store.appendMessage(sessionId, { role: 'user', content: `${pending.originalMessage}（已选择：${desc}）` });
+
+  const llm = createLlm();
+  const memory = buildContext(userId);
+  const messages = [
+    new SystemMessage(SYSTEM_PROMPT),
+    ...(memory.block ? [new SystemMessage(memory.block)] : []),
+    ...history,
+    new HumanMessage(pending.originalMessage),
+    new SystemMessage(
+      `用户已通过地址选择弹窗补充信息：${desc}。\n` +
+        `工具查询结果（JSON）：\n${JSON.stringify(result)}\n` +
+        `请基于以上结果直接回答用户最初的问题「${pending.originalMessage}」，不要调用任何工具。`
+    )
+  ];
+
+  send('status', { step: 'llm_slots', label: 'DeepSeek 组织回答', state: 'active' });
+  const stream = await llm.stream(messages);
+  let finalText = '';
+  for await (const chunk of stream) {
+    const text = textOf(chunk.content);
+    if (text) {
+      finalText += text;
+      send('delta', { text });
+    }
+  }
+  send('status', { step: 'llm_slots', label: '回复生成完成', state: 'done' });
+
+  if (finalText.trim()) {
+    await store.appendMessage(sessionId, { role: 'assistant', content: finalText });
+  }
+
+  if (userId) {
+    scheduleExtraction({ userId, sessionId, userMsg: `${pending.originalMessage}（已选择：${desc}）`, assistantMsg: finalText });
+    scheduleIdleSummary({ userId, sessionId });
+  }
+
+  send('done', { intent, mode: 'slot_filling' });
+}
+
+// 弹窗下拉数据源
+export function getCityOptions() {
+  return { freightCities: CITY_LIST, branchCities: BRANCH_CITIES };
 }

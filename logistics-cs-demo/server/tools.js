@@ -1,5 +1,5 @@
-// ============ Mock 工具：查运单 / 查运费时效 / 查知识库 ============
-import { SHIPMENTS, CITY_INFO, REMOTE_PROVINCES, FREIGHT_PRODUCTS, KNOWLEDGE_BASE } from './data.js';
+// ============ Mock 工具：查运单 / 查运费时效 / 查知识库 / 查网点 ============
+import { SHIPMENTS, CITY_INFO, REMOTE_PROVINCES, FREIGHT_PRODUCTS, KNOWLEDGE_BASE, BRANCHES } from './data.js';
 
 const delay = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -87,8 +87,58 @@ export async function queryKnowledge({ query = '', topN = 2 } = {}) {
   };
 }
 
+// 工具：查询营业网点（支持城市 / 区县 / 省份 + 关键词筛选）
+export async function queryBranches({ city, keyword = '', topN = 3 } = {}) {
+  await delay(600);
+  if (!city) return { needMore: true, missing: 'city', summary: '缺少城市，需补充信息' };
+
+  const norm = (s) => String(s || '').replace(/[市区县]$/g, '');
+  const kw = String(keyword || '').trim();
+
+  // 依次尝试：城市/区县精确匹配 -> 省份匹配（如"浙江"）-> 包含匹配（如"杭州市"）
+  let list = BRANCHES.filter((b) => norm(b.city) === norm(city) || norm(b.district) === norm(city));
+  if (!list.length && CITY_INFO[norm(city)]) {
+    const prov = CITY_INFO[norm(city)].province;
+    list = BRANCHES.filter((b) => CITY_INFO[b.city]?.province === prov);
+  }
+  if (!list.length) list = BRANCHES.filter((b) => city.includes(b.city));
+
+  if (!list.length) {
+    return {
+      found: false,
+      city,
+      empty: true,
+      summary: `${city} 暂无收录网点（演示数据仅覆盖部分城市，可建议用户通过小程序查询）`
+    };
+  }
+
+  // 关键词过滤（区县 / 地标 / 业务类型），未命中时保留全部并标注，避免空结果
+  let keywordMatched = false;
+  if (kw) {
+    const hit = list.filter((b) =>
+      [b.name, b.district, b.address, b.landmark, b.hours, b.services.join('')].some((t) => t.includes(kw))
+    );
+    if (hit.length) {
+      list = hit;
+      keywordMatched = true;
+    }
+  }
+
+  const branches = list.slice(0, topN);
+  return {
+    found: true,
+    city,
+    keyword: kw || null,
+    keywordMatched,
+    total: list.length,
+    branches,
+    summary: `${city}${kw && keywordMatched ? `（${kw}）` : ''} 命中 ${list.length} 个网点`
+  };
+}
+
 export const TOOLS = {
   query_shipment: queryShipment,
   query_freight: queryFreight,
-  query_knowledge: queryKnowledge
+  query_knowledge: queryKnowledge,
+  query_branches: queryBranches
 };
