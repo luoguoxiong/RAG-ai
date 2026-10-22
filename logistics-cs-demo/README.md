@@ -1,6 +1,6 @@
-# 物流智能客服 Demo（LangChain + DeepSeek 工具调用 + SSE）
+# 物流智能客服 Demo（LangGraph Agent + DeepSeek + SSE）
 
-基于 **Node.js + Express + LangChain（JS）+ DeepSeek** 的物流智能客服演示。LLM 真实 function calling 决定调用哪些工具，前后端交互全部通过 **SSE**，业务数据为 Mock。
+基于 **Node.js + Express + LangGraph（JS）+ DeepSeek** 的物流智能客服演示。ReAct Agent 由 LangGraph 的 `StateGraph`（agent ⇄ tools）+ `ToolNode` 编排（不再手写工具调用循环），槽位补全用 `interrupt()` 挂起图、`Command({ resume })` 断点续跑；LLM 真实 function calling 决定调用哪些工具，前后端交互全部通过 **SSE**，业务数据为 Mock。
 
 ## 功能
 
@@ -14,11 +14,11 @@ LLM（deepseek-chat）根据用户问题自主决策，调用 5 个工具：
 
 - **人工客服工作台**（`/agent.html`）：从 `support_human` 客服列表选择身份上岗，会话自动分配、用户消息实时推送，客服真人回复经 SSE 实时送达用户页面；客服工作台离线时消息照常入库并提示用户已记录，等待客服上线处理（不做任何自动应答）
 
-- 工具由 LLM 通过 **bindTools + function calling** 自主选择并抽取参数（城市、重量、运单号等实体抽取全部交给模型），支持一问多工具的链式调用
+- 工具由 LLM 通过 **bindTools + function calling** 自主选择并抽取参数（城市、重量、运单号等实体抽取全部交给模型），支持一问多工具的链式/并行调用（LangGraph `ToolNode` 执行后经条件边回到 agent）
 - 支持**多轮对话记忆**：第二轮"那换成 5 公斤呢？"会自动继承上一轮的城市上下文
 - Agent 过程（思考 -> 决定调用工具 -> 工具结果 -> 回复）以"过程徽章"实时展示，回复逐 token 流式输出
 - 未提供运单号/目的地时，LLM 会先追问而不是瞎调工具
-- **意图识别 + 槽位补全弹窗**：LLM 识别出查运费/查网点意图但缺城市参数时，服务端挂起本轮并推送 `ask_location` 事件，前端**弹窗选择地址**（寄出城市自动预填长期记忆的常用城市）后提交 `POST /api/chat/slots` 恢复执行——直接调工具 + 结果交 LLM 生成回答，替代纯文字追问
+- **意图识别 + 槽位补全弹窗**：工具发现缺城市参数时在节点内 `interrupt()` 挂起整张图（断点存 `MemorySaver`），服务端推送 `ask_location` 事件，前端**弹窗选择地址**（寄出城市自动预填长期记忆的常用城市）后提交 `POST /api/chat/slots`，用 `Command({ resume })` 续跑——工具重跑一次拿到用户选择，再交 LLM 生成回答，替代纯文字追问；表述里完全没有城市的常见问法（如"帮我查下运费"）另有一条不经 LLM 的规则快速路径
 - **长期记忆**：跨会话记住用户画像与偏好（常用寄出城市、业务身份、偏好档位等），带完整的更新策略（置信度合并、冲突消解、时间衰减、用户纠正、可遗忘）—— 设计详见 [docs/long-term-memory-design.md](docs/long-term-memory-design.md)
 
 ## 运行
@@ -70,9 +70,11 @@ public/                  前端（原生 HTML/CSS/JS，无构建）
 server/
   index.js               Express 入口：静态资源 + 路由（启动时自动建表）
   db.js                   PostgreSQL 连接池 + 建表 + 种子客服
-  agent.js               LangChain Agent：bindTools + 流式工具调用循环 + 会话记忆
+  agent.js               会话编排：上下文拼装（Prompt + 长期记忆 + 历史）/ 转人工快速路径 / 槽位补全 / 落库与记忆调度
+  graph.js               LangGraph Agent：StateGraph(agent ⇄ tools) + ToolNode + interrupt 槽位补全 + 流式事件映射
   llm.js                 ChatDeepSeek 封装（读取 .env，temperature 可覆盖）
   tools.js               业务工具实现（运单/运费/知识库/网点）+ scoreKnowledge
+  utils.js               通用小工具（消息取文本 / 截断 / 固定文案模拟流式）
   session.js             会话级 SSE 通道 + 人工客服会话管理（排队/接入/应答，状态持久化、重启可恢复）
   store.js               PostgreSQL 持久层：对话历史 + 人工会话状态存取（chat_sessions / chat_messages）
   memory.js              长期记忆：LLM 异步提取 + 合并更新策略 + 检索注入 + 会话摘要
@@ -92,7 +94,18 @@ data/
 
 **长期记忆系统**：以前端 localStorage 生成的 `userId` 为命名空间（无则按"无记忆"降级），分两层——**语义记忆**（跨会话用户画像事实 `data/memory.json`）与**情景记忆**（会话摘要，空闲 30 分钟/人工结束时生成）。回答时把 top 8 条记忆按 `confidence × recency`（半衰期：属性 90 天 / 偏好 60 天 / 事务 14 天）排序，注入为独立 SystemMessage（标注"可能过时，以用户当前表述为准"）；`query_freight` 未传寄出城市时自动用记忆兜底并推 `memory_used` 徽章。**更新策略**：每轮回答后异步（10s 去抖）LLM 按白名单提取 -> 按 `(type,key)` upsert 合并——值冲突按 `confidence × recency` 消解，用户显式纠正/明说无条件覆盖且旧值归档进 `history` 版本链，habit 类维护最近 3 值滑动窗口；context 类 14 天 TTL，confidence < 0.3 归档，每用户 100 条容量上限；命中使用 `confidence +0.05`，被矛盾未覆盖 `-0.2`；手机号/住址等敏感信息一律不抽取。前端右上角"我的记忆"面板可查看每条记忆的置信度/依据/使用次数、单条删除或"忘记我"。
 
-Agent 循环（`agent.js`）：`system prompt + history + user` -> `llm.bindTools(tools).stream()` -> 聚合 chunk 得到 `tool_calls` -> 逐个执行工具回填 `ToolMessage` -> 循环直到模型输出最终回答（最多 4 轮）。与 LangGraph `createReactAgent` 等价，手写循环便于把过程映射成 SSE 事件。
+**Agent 编排（LangGraph，`graph.js`）**：
+
+```
+START → agent（DeepSeek 决策）─┬─ 有 tool_calls → tools（ToolNode 执行）→ agent → …
+                               └─ 无 tool_calls → END
+```
+
+- 图状态只有 `messages`（官方 `messagesStateReducer` 增量合并）；模型用 `bindTools` 绑定 5 个工具，条件边用官方 `toolsCondition` 判断是否进入 `ToolNode`——原来的手写 ReAct 循环整段消失
+- 工具轮次用 `recursionLimit`（12 步 ≈ 4~5 轮工具调用）约束，超限时收口本轮而不是报错
+- **流式**：`graph.stream(input, { streamMode: ['updates', 'messages'] })`——`messages` 流只取 `agent` 节点的 token 增量推成 `delta` 事件；`updates` 流拿节点级更新与 `__interrupt__`。工具内部把调用/结果写成 `status` 徽章，SSE 协议与重构前一致（前端零改动）
+- **中断式槽位补全**：`query_freight` / `query_branches` 缺参时在工具内 `interrupt({ intent, missing, preset, originMemory })` 挂起图，`MemorySaver` 按 `thread_id` 保存断点（一个用户轮次一个 thread）；前端弹窗提交后用 `Command({ resume })` 续跑，工具重跑时 `interrupt()` 直接返回用户选择。弹窗作废 / 超时（10 分钟）会释放对应 thread，内存不留垃圾
+- **对话历史仍以 PostgreSQL 为准**：每轮从库里重建 `SystemPrompt + 长期记忆 + 最近 20 条历史` 作为图输入；检查点只服务中断续跑，所以服务重启后对话上下文照旧可恢复
 
 ## SSE 协议
 
@@ -139,4 +152,5 @@ Agent 循环（`agent.js`）：`system prompt + history + user` -> `llm.bindTool
 
 - `tools.js`：把 mock 实现换成真实轨迹 API、计价引擎、向量检索（RAG）、网点目录服务（POI）；工具签名（zod schema）不变，LLM 侧无需改动
 - `llm.js`：更换模型只需改 `DEEPSEEK_MODEL`，或把 ChatDeepSeek 换成其他 ChatModel
+- `graph.js`：换更复杂的编排（多 Agent 协作、子图、审批节点）只需改 `StateGraph` 的节点与边；接生产可把 `MemorySaver` 换成持久化 checkpointer（Postgres/Redis），thread 就能跨重启续跑
 - `session.js`：人工客服替换为真实客服工单系统（WebSocket / IM 网关）

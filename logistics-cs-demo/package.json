@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "物流智能客服 Demo：查知识库 / 查运单状态 / 查运费时效 / 转人工，Mock 数据 + SSE",
+  "description": "物流智能客服 Demo：LangGraph Agent（查运单 / 运费时效 / 知识库 / 网点 / 转人工）+ Mock 数据 + SSE",
   "scripts": {
     "start": "node server/index.js",
     "dev": "node --watch server/index.js"
@@ -14,6 +14,7 @@
   "dependencies": {
     "@langchain/core": "^0.3.80",
     "@langchain/deepseek": "^0.1.0",
+    "@langchain/langgraph": "^0.4.10",
     "dotenv": "^18.0.8",
     "express": "^4.21.2",
     "pg": "^8.13.1",
