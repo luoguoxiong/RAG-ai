@@ -6,7 +6,8 @@
   "description": "物流智能客服 Demo：LangGraph Agent（查运单 / 运费时效 / 知识库 / 网点 / 转人工）+ Mock 数据 + SSE",
   "scripts": {
     "start": "node server/index.js",
-    "dev": "node --watch server/index.js"
+    "dev": "node --watch server/index.js",
+    "migrate:memory": "node scripts/migrate-memory-json.js"
   },
   "engines": {
     "node": ">=18"

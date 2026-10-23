@@ -2,14 +2,19 @@
 // 设计文档：docs/long-term-memory-design.md
 // 数据分层：L2 语义记忆（facts，跨会话用户画像）+ L1 情景记忆（summaries，会话摘要）
 // 更新策略：LLM 异步提取 -> 按 (type,key) upsert -> 置信度×新近度 冲突消解 -> TTL/容量淘汰
+//
+// 生产化（P0）：持久层走 PostgreSQL（memstore.js），异步提取走持久化任务队列（memjobs.js），
+// 因此本模块的检索/调度接口均为 async；调度只负责"入队"，真正执行由 worker 完成。
 import { SystemMessage, HumanMessage } from '@langchain/core/messages';
 import { createLlm } from './llm.js';
 import * as memstore from './memstore.js';
+import * as memjobs from './memjobs.js';
 import * as store from './store.js';
 import { pushEvent } from './session.js';
 
 const EXTRACT_DEBOUNCE_MS = 10_000; // 提取去抖窗口：窗口内多轮合并成一次 LLM 调用
 const IDLE_SUMMARY_MS = 30 * 60 * 1000; // 会话空闲 30 分钟后生成情景摘要（L1）
+const EXTRACT_TIMEOUT_MS = 20_000; // 提取 LLM 调用超时（超时进队列退避重试，不影响主链路）
 const CONTEXT_TTL_MS = 14 * 24 * 60 * 1000; // context 类记忆 TTL（进行中事务）
 const TOP_FACTS = 8; // 注入记忆的事实条数上限
 const TOP_SUMMARIES = 2; // 注入的最近会话摘要条数
@@ -78,11 +83,14 @@ function sweepExpired(user) {
 
 // ---------- 记忆检索与注入（buildContext） ----------
 // 返回 { block, usedFacts }；block 拼入 system prompt 后的独立 SystemMessage
-export function buildContext(userId) {
+export async function buildContext(userId) {
   if (!userId) return { block: '', usedFacts: [] };
-  const user = memstore.readUser(userId, { withCopy: false });
+  // 一次事务内完成"惰性清理 + 读取"：清理结果与注入内容保持一致（无变更时 diff 为空不落盘）
+  const user = await memstore.mutateUser(userId, (u) => {
+    sweepExpired(u);
+    return { facts: u.facts, summaries: u.summaries };
+  });
   if (!user) return { block: '', usedFacts: [] };
-  if (sweepExpired(user)) memstore.mutateUser(userId, () => {}); // sweep 已原地改 user，这里仅触发落盘
 
   const facts = user.facts
     .filter((f) => f.status === 'active')
@@ -108,9 +116,9 @@ export function buildContext(userId) {
 }
 
 // 工具兜底：query_freight 未传 origin 时从记忆补默认寄出城市
-export function recallFact(userId, type, key) {
+export async function recallFact(userId, type, key) {
   if (!userId) return null;
-  const facts = memstore.listFacts(userId, 'active');
+  const facts = await memstore.listFacts(userId, 'active');
   return facts.find((f) => f.type === type && f.key === key) || null;
 }
 
@@ -160,7 +168,7 @@ function validOp(op) {
 }
 
 async function llmExtractOps(dialogues, existingFacts) {
-  const llm = createLlm({ temperature: 0 });
+  const llm = createLlm({ temperature: 0, timeout: EXTRACT_TIMEOUT_MS });
   const factsText = existingFacts.length
     ? existingFacts.map((f) => `- ${f.type}.${f.key} = ${factValueText(f)}（置信度 ${f.confidence}）`).join('\n')
     : '（暂无）';
@@ -186,7 +194,7 @@ function applyOps(user, ops) {
   for (const op of ops) {
     const facts = user.facts;
     const old = facts.find((f) => f.status === 'active' && f.type === op.type && f.key === op.key);
-    const label = KEY_LABELS[`${op.type}.${op.key}`] || op.key;
+    const label = KEY_LABELS[`${op.type}.${op.key}`] || KEY_LABELS[op.key] || op.key;
 
     // 删除：用户否认/要求忘记 -> superseded（软删除，可回溯）
     if (op.op === 'delete') {
@@ -272,72 +280,82 @@ function applyOps(user, ops) {
   return events;
 }
 
-// ---------- 提取调度（fire-and-forget，不阻塞主回答链路） ----------
-const pendingExtracts = new Map(); // userId -> { timer, sessionId, dialogues }
-const idleTimers = new Map(); // sessionId -> timer
-
-export function scheduleExtraction({ userId, sessionId, userMsg, assistantMsg }) {
-  if (!userId) return;
-  const p = pendingExtracts.get(userId) || { timer: null, sessionId, dialogues: [] };
-  p.sessionId = sessionId;
-  if (userMsg) p.dialogues.push({ role: 'user', content: userMsg });
-  if (assistantMsg) p.dialogues.push({ role: 'assistant', content: assistantMsg });
-  clearTimeout(p.timer);
-  p.timer = setTimeout(() => {
-    pendingExtracts.delete(userId);
-    runExtraction(userId, p.sessionId, p.dialogues).catch((err) =>
-      console.warn('[memory] 记忆提取失败:', err?.message || err)
-    );
-  }, EXTRACT_DEBOUNCE_MS);
-  pendingExtracts.set(userId, p);
+// ---------- 提取调度（入队即返回，不阻塞主回答链路） ----------
+// 任务落库（memory_jobs）：进程重启不丢、失败自动退避重试、同一去抖键窗口内合并。
+export async function scheduleExtraction({ userId, sessionId, userMsg, assistantMsg }) {
+  if (!userId) return null;
+  const turns = [];
+  if (userMsg) turns.push({ role: 'user', content: userMsg });
+  if (assistantMsg) turns.push({ role: 'assistant', content: assistantMsg });
+  if (!turns.length) return null;
+  return memjobs.enqueue({
+    kind: 'extract',
+    dedupeKey: `extract:${userId}:${sessionId}`,
+    userId,
+    sessionId,
+    payload: turns,
+    delayMs: EXTRACT_DEBOUNCE_MS
+  });
 }
 
+// worker 侧执行体：读取任务 payload -> LLM 提取 -> 事务内合并落盘 -> SSE 通知
 async function runExtraction(userId, sessionId, dialogues) {
-  if (!dialogues.length) return;
-  const existingFacts = memstore.listFacts(userId, 'active');
+  if (!dialogues || !dialogues.length) return;
+  const existingFacts = await memstore.listFacts(userId, 'active');
   const ops = await llmExtractOps(dialogues, existingFacts);
   if (!ops.length) return;
 
-  const events = memstore.mutateUser(userId, (user) => {
+  const events = await memstore.mutateUser(userId, (user) => {
     sweepExpired(user);
     return applyOps(user, ops);
   });
   // 提取结果经会话级 SSE 通道通知前端（徽章：已记住 / 已更新 / 已忘记）
-  for (const ev of events) {
+  for (const ev of events || []) {
     pushEvent(sessionId, 'memory_saved', ev);
   }
 }
 
 // ---------- 情景记忆（L1）：会话摘要 ----------
-// 每轮回答后重置空闲计时器；空闲超时 / 人工会话结束时触发摘要提取
-export function scheduleIdleSummary({ userId, sessionId }) {
-  if (!userId || !sessionId) return;
-  clearTimeout(idleTimers.get(sessionId));
-  idleTimers.set(
+// 每轮回答后重置空闲窗口（入队刷新 run_at）；空闲超时 / 人工会话结束时由 worker 触发摘要
+export async function scheduleIdleSummary({ userId, sessionId }) {
+  if (!userId || !sessionId) return null;
+  return memjobs.enqueue({
+    kind: 'summary',
+    dedupeKey: `summary:${userId}:${sessionId}`,
+    userId,
     sessionId,
-    setTimeout(() => {
-      idleTimers.delete(sessionId);
-      summarizeSession({ userId, sessionId }).catch((err) =>
-        console.warn('[memory] 会话摘要失败:', err?.message || err)
-      );
-    }, IDLE_SUMMARY_MS)
-  );
+    payload: [],
+    delayMs: IDLE_SUMMARY_MS
+  });
 }
 
-export function cancelIdleSummary(sessionId) {
-  clearTimeout(idleTimers.get(sessionId));
-  idleTimers.delete(sessionId);
+export async function cancelIdleSummary(sessionId) {
+  return memjobs.cancelPending('summary', sessionId);
+}
+
+// ---------- worker 启停（由服务入口调用） ----------
+export function startMemoryWorker({ scanMs } = {}) {
+  return memjobs.startWorker(
+    {
+      extract: (job) => runExtraction(job.user_id, job.session_id, job.payload || []),
+      summary: (job) => summarizeSession({ userId: job.user_id, sessionId: job.session_id })
+    },
+    scanMs
+  );
+}
+export function stopMemoryWorker() {
+  return memjobs.stopWorker();
 }
 
 // 摘要已有更新的版本则跳过（以会话最后一条消息时间为基准去重）
 export async function summarizeSession({ userId, sessionId }) {
   const msgs = (await store.getMessages(sessionId)).filter((m) => m.role === 'user' || m.role === 'assistant');
   if (!msgs.length) return false;
-  const lastTs = msgs[msgs.length - 1].ts || 0;
-  const existing = memstore.getSummaries(userId).find((s) => s.sessionId === sessionId);
-  if (existing && existing.untilTs >= lastTs) return false;
+  const lastTs = Number(msgs[msgs.length - 1].ts || 0);
+  const existing = (await memstore.getSummaries(userId)).find((s) => s.sessionId === sessionId);
+  if (existing && Number(existing.untilTs || 0) >= lastTs) return false;
 
-  const llm = createLlm({ temperature: 0 });
+  const llm = createLlm({ temperature: 0, timeout: EXTRACT_TIMEOUT_MS });
   const dialogueText = msgs
     .slice(-12)
     .map((m) => `${m.role === 'user' ? '用户' : '客服'}：${String(m.content).slice(0, 200)}`)
@@ -350,28 +368,28 @@ export async function summarizeSession({ userId, sessionId }) {
   ]);
   const summary = String(res.content ?? '').trim().slice(0, 60);
   if (!summary) return false;
-  memstore.appendSummary(userId, { sessionId, summary, untilTs: lastTs, ts: Date.now() });
+  await memstore.appendSummary(userId, { sessionId, summary, untilTs: lastTs, ts: Date.now() });
   return true;
 }
 
 // ---------- 调试/管理 ----------
 // 工具侧展示用：{ label, value }
 export function factDisplay(fact) {
-  const label = KEY_LABELS[`${fact.type}.${fact.key}`] || fact.key;
+  const label = KEY_LABELS[`${fact.type}.${fact.key}`] || KEY_LABELS[fact.key] || fact.key;
   return { label, value: factValueText(fact) };
 }
 export { bumpFact } from './memstore.js';
 
 // 管理接口的薄封装：单条删除（软删）与"忘记我"（清空全部）
-export function deleteFact(userId, factId) {
+export async function deleteFact(userId, factId) {
   return memstore.archiveFact(userId, factId, 'superseded');
 }
-export function forgetAll(userId) {
+export async function forgetAll(userId) {
   return memstore.forgetUser(userId);
 }
 
-export function getMemoryView(userId) {
-  const u = memstore.readUser(userId);
+export async function getMemoryView(userId) {
+  const u = await memstore.readUser(userId);
   if (!u) return { userId, facts: [], summaries: [] };
   const facts = u.facts
     .filter((f) => f.status === 'active')
@@ -379,7 +397,7 @@ export function getMemoryView(userId) {
       id: f.id,
       type: f.type,
       key: f.key,
-      label: KEY_LABELS[`${f.type}.${f.key}`] || f.key,
+      label: KEY_LABELS[`${f.type}.${f.key}`] || KEY_LABELS[f.key] || f.key,
       typeLabel: TYPE_ALIASES[f.type] || f.type,
       value: factValueText(f),
       confidence: Math.round((f.confidence ?? 0.5) * 100) / 100,

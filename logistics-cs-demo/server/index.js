@@ -21,7 +21,9 @@ import {
   deleteFact,
   forgetAll,
   cancelIdleSummary,
-  summarizeSession
+  summarizeSession,
+  startMemoryWorker,
+  stopMemoryWorker
 } from './memory.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -149,7 +151,7 @@ app.post('/api/human/end', async (req, res) => {
   }
   await endHumanSession(sessionId);
   if (userId) {
-    cancelIdleSummary(sessionId);
+    await cancelIdleSummary(sessionId).catch(() => {});
     summarizeSession({ userId: String(userId), sessionId }).catch((err) =>
       console.warn('[memory] 会话摘要失败:', err?.message || err)
     );
@@ -276,37 +278,52 @@ app.post('/api/agent/end', async (req, res) => {
 
 // ---------- 长期记忆管理 API ----------
 // 查看记忆（"我的记忆"面板 / 调试）
-app.get('/api/memory', (req, res) => {
+app.get('/api/memory', async (req, res) => {
   const userId = String(req.query.userId || '');
   if (!userId) {
     res.status(400).json({ error: 'userId 必填' });
     return;
   }
-  res.json(getMemoryView(userId));
+  try {
+    res.json(await getMemoryView(userId));
+  } catch (err) {
+    console.error('[memory] 查询异常:', err);
+    res.status(500).json({ error: '记忆查询失败' });
+  }
 });
 
 // 删除单条记忆
-app.delete('/api/memory/:userId/facts/:factId', (req, res) => {
+app.delete('/api/memory/:userId/facts/:factId', async (req, res) => {
   const { userId, factId } = req.params;
-  const ok = deleteFact(String(userId), String(factId));
-  res.json({ ok });
+  try {
+    res.json({ ok: await deleteFact(String(userId), String(factId)) });
+  } catch (err) {
+    console.error('[memory] 删除异常:', err);
+    res.status(500).json({ error: '记忆删除失败' });
+  }
 });
 
 // "忘记我"：清空该用户全部长期记忆（合规）
-app.post('/api/memory/forget', (req, res) => {
+app.post('/api/memory/forget', async (req, res) => {
   const { userId } = req.body || {};
   if (!userId) {
     res.status(400).json({ error: 'userId 必填' });
     return;
   }
-  res.json({ ok: forgetAll(String(userId)) });
+  try {
+    res.json({ ok: await forgetAll(String(userId)) });
+  } catch (err) {
+    console.error('[memory] 清空异常:', err);
+    res.status(500).json({ error: '记忆清空失败' });
+  }
 });
 
 const PORT = Number(process.env.PORT) || 3000;
 
-// 启动前先完成建表（chat_sessions / chat_messages / support_human）与种子客服
+// 启动前先完成建表（会话 / 消息 / 记忆 / 任务队列）与种子客服，再拉起记忆任务 worker
 initDb()
   .then(() => {
+    startMemoryWorker();
     app.listen(PORT, () => {
       console.log(`[物流智能客服 demo] 已启动: http://localhost:${PORT}`);
     });
@@ -315,3 +332,12 @@ initDb()
     console.error('[db] PostgreSQL 初始化失败，服务未启动:', err.message);
     process.exit(1);
   });
+
+// 优雅退出：停掉 worker 并释放连接池，避免任务在滚动发布时被硬杀
+for (const signal of ['SIGINT', 'SIGTERM']) {
+  process.on(signal, () => {
+    console.log(`[server] 收到 ${signal}，正在关闭...`);
+    stopMemoryWorker();
+    pool.end().finally(() => process.exit(0));
+  });
+}

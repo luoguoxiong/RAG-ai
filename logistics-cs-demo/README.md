@@ -78,10 +78,11 @@ server/
   session.js             会话级 SSE 通道 + 人工客服会话管理（排队/接入/应答，状态持久化、重启可恢复）
   store.js               PostgreSQL 持久层：对话历史 + 人工会话状态存取（chat_sessions / chat_messages）
   memory.js              长期记忆：LLM 异步提取 + 合并更新策略 + 检索注入 + 会话摘要
-  memstore.js            记忆持久层：用户画像事实 + 会话摘要（data/memory.json，原子写）
+  memstore.js            记忆持久层：PostgreSQL（memory_facts / memory_summaries，事务 + 用户级锁）
+  memjobs.js             记忆异步任务队列：落库去抖、SKIP LOCKED 认领、失败退避重试、崩溃回收
   data.js                Mock 数据：知识库 / 运单 / 运费产品 / 网点 / 城市线路
-data/
-  memory.json            长期记忆持久化文件（运行时生成，已 gitignore）
+scripts/
+  migrate-memory-json.js 一次性迁移：旧 data/memory.json -> PostgreSQL（npm run migrate:memory）
 ```
 
 **对话历史持久化（PostgreSQL）**：所有消息（智能客服问答、转人工事件、人工客服对话）按 sessionId 写入 `chat_messages` 表（单会话最多保留 200 条，超出滚动删除最早记录）；LLM 上下文与页面历史都从存储读取，服务重启后对话不丢。人工会话状态（排队/接入/结束）落在 `chat_sessions` 表的 `human_*` 字段，`GET /api/history` 一并返回；前端刷新后据此恢复人工模式。服务重启后按需从持久层恢复：`active` 直接恢复可继续对话，`queued` 按 `joinAt` 续排接入、已过期的立即补推接入（超过 24h 的残留状态视为已结束）。
@@ -91,8 +92,13 @@ data/
 - `chat_sessions(session_id PK, human_status, human_queue_position, human_agent_id FK->support_human, human_join_at, human_updated_at, created_at, updated_at)`
 - `chat_messages(id PK, session_id FK->chat_sessions, role, name, content, ts, created_at)`，索引 `(session_id, id)`
 - `support_human(id PK, name, code UNIQUE, status, created_at)` —— 客服表；人工接入时从该表取 `status='online'` 的客服，无在线客服时回退到种子客服
+- `memory_facts(id PK, user_id, type, key, value JSONB, confidence, source, evidence, hits, status, history JSONB, created_at, updated_at, expires_at, archived_at)`，部分唯一索引 `(user_id, type, key) WHERE status='active'` 保证同键只有一条生效事实
+- `memory_summaries(id PK, user_id, session_id, summary, until_ts, ts)`，唯一索引 `(user_id, session_id)`
+- `memory_jobs(id PK, kind, dedupe_key, user_id, session_id, payload JSONB, status, run_at, attempts, last_error)`，部分唯一索引 `(dedupe_key) WHERE status='pending'` 做去抖合并
 
-**长期记忆系统**：以前端 localStorage 生成的 `userId` 为命名空间（无则按"无记忆"降级），分两层——**语义记忆**（跨会话用户画像事实 `data/memory.json`）与**情景记忆**（会话摘要，空闲 30 分钟/人工结束时生成）。回答时把 top 8 条记忆按 `confidence × recency`（半衰期：属性 90 天 / 偏好 60 天 / 事务 14 天）排序，注入为独立 SystemMessage（标注"可能过时，以用户当前表述为准"）；`query_freight` 未传寄出城市时自动用记忆兜底并推 `memory_used` 徽章。**更新策略**：每轮回答后异步（10s 去抖）LLM 按白名单提取 -> 按 `(type,key)` upsert 合并——值冲突按 `confidence × recency` 消解，用户显式纠正/明说无条件覆盖且旧值归档进 `history` 版本链，habit 类维护最近 3 值滑动窗口；context 类 14 天 TTL，confidence < 0.3 归档，每用户 100 条容量上限；命中使用 `confidence +0.05`，被矛盾未覆盖 `-0.2`；手机号/住址等敏感信息一律不抽取。前端右上角"我的记忆"面板可查看每条记忆的置信度/依据/使用次数、单条删除或"忘记我"。
+**记忆并发与可靠性（生产化）**：所有"读-改-写"都在 `withUserLock` 事务内执行，用 `pg_advisory_xact_lock(user_id)` 串行化同一用户、提交前按 id 做 diff 精确落盘（不再整文件重写）；命中计数走原子 SQL。异步提取不再用进程内 `setTimeout`，而是写入 `memory_jobs`：同一 `dedupe_key` 的 pending 任务合并 payload 并推迟 `run_at`（等价于 10s 去抖），worker 用 `FOR UPDATE SKIP LOCKED` 认领、按用户级 advisory lock 串行执行、失败指数退避重试 3 次后置 `dead`，进程崩溃留下的 `running` 任务超过 5 分钟租约自动回收。多实例部署时任务不会被重复消费。
+
+**长期记忆系统**：以前端 localStorage 生成的 `userId` 为命名空间（无则按"无记忆"降级），分两层——**语义记忆**（跨会话用户画像事实，存 `memory_facts`）与**情景记忆**（会话摘要，空闲 30 分钟/人工结束时生成）。回答时把 top 8 条记忆按 `confidence × recency`（半衰期：属性 90 天 / 偏好 60 天 / 事务 14 天）排序，注入为独立 SystemMessage（标注"可能过时，以用户当前表述为准"）；`query_freight` 未传寄出城市时自动用记忆兜底并推 `memory_used` 徽章。**更新策略**：每轮回答后异步（10s 去抖）LLM 按白名单提取 -> 按 `(type,key)` upsert 合并——值冲突按 `confidence × recency` 消解，用户显式纠正/明说无条件覆盖且旧值归档进 `history` 版本链，habit 类维护最近 3 值滑动窗口；context 类 14 天 TTL，confidence < 0.3 归档，每用户 100 条容量上限；命中使用 `confidence +0.05`，被矛盾未覆盖 `-0.2`；手机号/住址等敏感信息一律不抽取。前端右上角"我的记忆"面板可查看每条记忆的置信度/依据/使用次数、单条删除或"忘记我"。
 
 **Agent 编排（LangGraph，`graph.js`）**：
 
