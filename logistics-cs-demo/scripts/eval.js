@@ -34,7 +34,7 @@ const uid = (tag) => `eval-${RUN}-usr-${tag}`;
 let serverProc = null;
 
 async function startServer() {
-  const env = { ...process.env, PORT: String(PORT) };
+  const env = { ...process.env, PORT: String(PORT), RATE_LIMIT_PER_MIN: '0' }; // 评测关闭入口限流（单 IP 合成流量，避免 429 干扰指标）
   delete env.NODE_OPTIONS; // 剥离 IDE 注入的 shim，避免子进程 crypto 被破坏
   serverProc = spawn(process.execPath, ['server/index.js'], {
     cwd: ROOT,
@@ -300,7 +300,9 @@ async function phaseMemory() {
 
   // 3.1 写入：同一会话连发 4 条陈述，一次去抖提取应产出 4 类白名单记忆
   const s1 = sid('mem-seed');
-  for (const msg of ['我常从苏州发货，麻烦记一下', '我是做电商的，发货量比较大', '寄东西我一般都选特快，快一点', '最近常往郑州发货']) {
+  // 注意：种子句不能命中规则快速路径（如"寄东西…"会触发缺城市弹窗、不经 LLM 也不入抽取队列），
+  // 否则该句永远进不了记忆抽取输入，product_tier 只能靠其他轮次回复偶然带出
+  for (const msg of ['我常从苏州发货，麻烦记一下', '我是做电商的，发货量比较大', '我一般都选特快的产品，快一点', '最近常往郑州发货']) {
     await sseChat('/api/chat', { sessionId: s1, message: msg, userId: user });
   }
   const deadline = Date.now() + 120000;

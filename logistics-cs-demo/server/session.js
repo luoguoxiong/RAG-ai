@@ -1,70 +1,26 @@
-// ============ 会话级 SSE 通道 + 人工客服会话管理（mock） ============
+// ============ 人工客服会话管理（mock）+ 会话级事件推送 ============
 // 每个浏览器会话通过 GET /api/events?sessionId=xxx 建立一条长连接 EventSource，
 // 服务端通过该通道推送：转人工排队、人工接入、人工消息、输入中、会话结束等事件。
+// SSE 通道注册与跨实例投递已外置到 bus.js（本地直写 + Redis pub/sub 桥接；
+// 未配置 REDIS_URL 时等价于原进程内 Map 实现），本模块只保留业务语义。
 import * as store from './store.js';
 import { pool } from './db.js';
+import { pushEvent, isAgentOnline } from './bus.js';
 
-const channels = new Map(); // sessionId -> Set<ServerResponse>
-const humanSessions = new Map(); // sessionId -> human session
-const agentChannels = new Map(); // agentId -> Set<ServerResponse>（客服工作台长连接）
+export { addChannel, addAgentChannel } from './bus.js';
+
+const humanSessions = new Map(); // sessionId -> human session（进程内缓存，回源见 getSession）
 
 function push(sessionId, event, data) {
-  const set = channels.get(sessionId);
-  if (!set) return;
-  const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
-  for (const res of set) {
-    try {
-      res.write(payload);
-    } catch {
-      // 连接已断开，忽略
-    }
-  }
+  pushEvent('session', sessionId, event, data);
 }
 
-// 客服工作台通道：新会话分配 / 用户新消息 / 会话结束 都经此推送
-export function addAgentChannel(agentId, res) {
-  if (!agentChannels.has(agentId)) agentChannels.set(agentId, new Set());
-  const set = agentChannels.get(agentId);
-  set.add(res);
-  res.write(`event: connected\ndata: ${JSON.stringify({ agentId, ts: Date.now() })}\n\n`);
-  return () => {
-    set.delete(res);
-    if (!set.size) agentChannels.delete(agentId);
-  };
-}
-
-export function pushAgentEvent(agentId, event, data) {
-  const set = agentChannels.get(agentId);
-  if (!set) return;
-  const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
-  for (const res of set) {
-    try {
-      res.write(payload);
-    } catch {
-      // 连接已断开，忽略
-    }
-  }
-}
-
-// 该客服的工作台是否在线（决定用户消息走真人回复还是 mock 自动兜底）
-export function isAgentOnline(agentId) {
-  const set = agentChannels.get(agentId);
-  return !!set && set.size > 0;
-}
-
-export function addChannel(sessionId, res) {
-  if (!channels.has(sessionId)) channels.set(sessionId, new Set());
-  const set = channels.get(sessionId);
-  set.add(res);
-  push(sessionId, 'connected', { sessionId, ts: Date.now() });
-  return () => {
-    set.delete(res);
-    if (!set.size) channels.delete(sessionId);
-  };
+function pushAgentEvent(agentId, event, data) {
+  pushEvent('agent', agentId, event, data);
 }
 
 // 供外部模块（如长期记忆系统）经会话级通道推送事件；无在线通道时静默忽略
-export function pushEvent(sessionId, event, data) {
+export function pushSessionEvent(sessionId, event, data) {
   push(sessionId, event, data);
 }
 
@@ -75,6 +31,7 @@ export function pushEvent(sessionId, event, data) {
 // - queued：按 joinAt 续排接入定时器；已过期的立即补上接入
 const JOIN_DELAY_MS = 4000; // 排队后多久 mock 客服接入
 const HUMAN_STATE_TTL_MS = 24 * 60 * 60 * 1000; // 超过 24h 的残留人工状态视为已结束
+const HUMAN_CACHE_TTL_MS = 2000; // 缓存回源间隔：多实例部署下防跨进程脏读（其他实例改了状态本进程及时看见）
 
 const FALLBACK_AGENT = { name: '林晓', code: 'CS1024' }; // 客服表为空时的兜底
 
@@ -95,30 +52,48 @@ async function persistHuman(s) {
   });
 }
 
-// 从持久层取人工会话（内存没有时自动恢复）
+// 从持久层取人工会话（缓存过期或缺失时自动恢复）
+// 多实例语义：缓存 2s 内可信；过期后强制回源 PG，防止另一实例已改变状态（如已接入/已结束）而本进程拿着旧值
 async function getSession(sessionId) {
-  let s = humanSessions.get(sessionId);
-  if (s) return s;
+  const cached = humanSessions.get(sessionId);
+  if (cached && Date.now() - cached.fetchedAt < HUMAN_CACHE_TTL_MS) return cached;
 
   const saved = await store.getHumanState(sessionId);
-  if (!saved || saved.status === 'ended') return null;
+  if (!saved || saved.status === 'ended') {
+    humanSessions.delete(sessionId);
+    return null;
+  }
   if (saved.updatedAt && Date.now() - saved.updatedAt > HUMAN_STATE_TTL_MS) {
     await store.setHumanState(sessionId, { status: 'ended' }); // 残留状态过期清理
+    humanSessions.delete(sessionId);
     return null;
   }
 
-  s = {
-    sessionId,
-    status: saved.status,
-    queuePosition: saved.queuePosition ?? 1,
-    agent: saved.agent || null,
-    joinAt: saved.joinAt ?? null,
-    timers: [] // 定时器不持久化，恢复后按需重建
-  };
-  humanSessions.set(sessionId, s);
-  if (s.status === 'queued' && s.joinAt) {
-    if (Date.now() >= s.joinAt) activate(s, true).catch(() => {});
-    else s.timers.push(setTimeout(() => activate(s).catch(() => {}), Math.max(0, s.joinAt - Date.now())));
+  let s;
+  if (cached && cached.status === saved.status) {
+    // 状态未变：仅刷新易变字段，不重建定时器
+    Object.assign(cached, {
+      queuePosition: saved.queuePosition ?? 1,
+      agent: saved.agent || cached.agent,
+      joinAt: saved.joinAt ?? cached.joinAt,
+      fetchedAt: Date.now()
+    });
+    s = cached;
+  } else {
+    s = {
+      sessionId,
+      status: saved.status,
+      queuePosition: saved.queuePosition ?? 1,
+      agent: saved.agent || null,
+      joinAt: saved.joinAt ?? null,
+      fetchedAt: Date.now(),
+      timers: [] // 定时器不持久化，恢复后按需重建
+    };
+    humanSessions.set(sessionId, s);
+    if (s.status === 'queued' && s.joinAt) {
+      if (Date.now() >= s.joinAt) activate(s, true).catch(() => {});
+      else s.timers.push(setTimeout(() => activate(s).catch(() => {}), Math.max(0, s.joinAt - Date.now())));
+    }
   }
   return s;
 }
@@ -126,10 +101,22 @@ async function getSession(sessionId) {
 // ---------- 人工客服（排队 -> 客服接入 -> 真人回复） ----------
 
 // 客服接入：推送接入事件 + 通知客服工作台有新会话（immediate=true 用于重启后补推）
+// 多实例安全：CAS 抢占（仅 queued -> active），保证只有一个实例执行接入流程，
+// 避免多个实例同时定时到点 / 同时恢复时重复推送欢迎语与分配事件
 async function activate(s, immediate = false) {
+  const agent = await pickAgent(); // 从 support_human 客服表取在线客服
+  const won = await store.activateHumanQueued(s.sessionId, agent, s.joinAt);
+  if (!won) {
+    // 已被其他实例接入：仅刷新本地缓存，不重复推送
+    const saved = await store.getHumanState(s.sessionId).catch(() => null);
+    s.status = 'active';
+    s.agent = saved?.agent || s.agent;
+    s.fetchedAt = Date.now();
+    return;
+  }
   s.status = 'active';
-  s.agent = await pickAgent(); // 从 support_human 客服表取在线客服
-  await persistHuman(s);
+  s.agent = agent;
+  s.fetchedAt = Date.now();
   push(s.sessionId, 'human_joined', { agent: s.agent });
   if (s.agent.id) {
     pushAgentEvent(s.agent.id, 'session_assigned', { sessionId: s.sessionId, agent: s.agent });
@@ -154,6 +141,7 @@ export async function startHumanSession(sessionId) {
     queuePosition: 1 + Math.floor(Math.random() * 2),
     agent: null,
     joinAt: Date.now() + JOIN_DELAY_MS,
+    fetchedAt: Date.now(),
     timers: []
   };
   humanSessions.set(sessionId, s);
@@ -179,7 +167,7 @@ export async function humanUserMessage(sessionId, text) {
     return true;
   }
   const agentId = s.agent?.id;
-  if (agentId && isAgentOnline(agentId)) {
+  if (agentId && (await isAgentOnline(agentId))) {
     // 真人模式：推送到客服工作台，由客服手动回复（agentReply）
     pushAgentEvent(agentId, 'user_message', { sessionId, text, agent: s.agent });
     return true;

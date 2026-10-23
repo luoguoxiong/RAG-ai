@@ -1,0 +1,11 @@
+# 本项目专用 Redis：挂起槽位 / SSE 事件总线 / 限流窗口 / 客服在线状态（多实例共享）
+# 端口用 6390，避免与本机其他服务占用的 6379 冲突；demo 数据不持久化，重启即清
+# 启动：docker compose up -d redis   停止：docker compose down
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: logistics-cs-redis
+    ports:
+      - '127.0.0.1:6390:6379'
+    command: ['redis-server', '--save', '', '--appendonly', 'no', '--maxmemory', '256mb', '--maxmemory-policy', 'allkeys-lru']
+    restart: unless-stopped

@@ -4,19 +4,23 @@
 //                             └─ 无 tool_calls → END
 // 槽位缺失（如查运费没给目的城市）时，工具内部调用 interrupt() 挂起整张图，
 // 前端弹窗补参后由 Command({ resume }) 从断点续跑——同一个工具会重跑一次并拿到用户选择的值。
-// 图状态由 MemorySaver 按 thread_id 保存（一个用户轮次一个 thread，仅用于中断续跑；
-// 对话历史仍以 PostgreSQL 为准，每轮重新注入，服务重启不丢上下文）。
+// 图状态由 PostgreSQL checkpointer（PostgresSaver）按 thread_id 持久化：
+//   - 多实例共享（A 实例挂起的弹窗可在 B 实例续跑）、重启不丢；
+//   - Node 内存不再随挂起数增长（状态落库）。
+// thread 是"中断续跑"的短生命周期状态：正常收尾/作废时 deleteThread；
+// 用户放弃弹窗的残留由 pending_threads 注册表 + sweeper 兜底清理（见文件底部）。
 import {
   Annotation,
   StateGraph,
   START,
   END,
-  MemorySaver,
   GraphRecursionError,
   interrupt,
   isGraphInterrupt,
   messagesStateReducer
 } from '@langchain/langgraph';
+import { PostgresSaver } from '@langchain/langgraph-checkpoint-postgres';
+import { pool } from './db.js';
 import { ToolNode, toolsCondition } from '@langchain/langgraph/prebuilt';
 import { tool } from '@langchain/core/tools';
 import { z } from 'zod';
@@ -39,8 +43,55 @@ const AgentState = Annotation.Root({
   })
 });
 
-// 检查点存储：内存版即可（中断只是"本次提问缺参数"的短生命周期状态，10 分钟 TTL 后清理）
-const checkpointer = new MemorySaver();
+// 检查点存储：PostgreSQL 持久化（与业务表共用连接池；setup() 幂等建 checkpoint* 表）。
+// 多实例共享：A 实例 interrupt() 挂起的图，B 实例可用同一 thread_id 续跑。
+export const checkpointer = new PostgresSaver(pool);
+
+/** 启动时调用：创建/迁移 checkpoint 表（幂等） */
+export async function initCheckpointer() {
+  await checkpointer.setup();
+}
+
+// ---------- 挂起 thread 注册表：兜底清理被用户放弃的检查点 ----------
+// 挂起槽位本体在 Redis（原生 TTL 过期），但过期后没人记得"还有一个检查点要删"。
+// 挂起登记时同步写入注册表；Redis 键过期后由 sweeper 按注册表释放对应检查点，
+// 保证 PostgreSQL 中的 checkpoint 数据不随用户放弃弹窗而累积。
+
+/** 登记挂起 thread（幂等，刷新时间戳）。先登记再写 Redis：任何后续失败都能被 sweeper 兜底 */
+export async function registerPendingThread(threadId, sessionId) {
+  if (!threadId) return;
+  await pool.query(
+    `INSERT INTO pending_threads (thread_id, session_id) VALUES ($1, $2)
+     ON CONFLICT (thread_id) DO UPDATE SET created_ts = now();`,
+    [threadId, sessionId]
+  );
+}
+
+/** 摘除注册（弹窗已提交/已作废，检查点即时释放，不再归 sweeper 管） */
+export async function unregisterPendingThread(threadId) {
+  if (!threadId) return;
+  await pool.query(`DELETE FROM pending_threads WHERE thread_id = $1;`, [threadId]).catch(() => {});
+}
+
+/** 兜底清理：周期性释放超过 TTL 仍未续跑的挂起检查点（多实例任意一个进程执行即可） */
+export function startCheckpointSweeper({ ttlMs = 10 * 60 * 1000, intervalMs = 60_000 } = {}) {
+  const timer = setInterval(async () => {
+    try {
+      const { rows } = await pool.query(
+        `DELETE FROM pending_threads
+         WHERE created_ts < now() - ($1::text || ' milliseconds')::interval
+         RETURNING thread_id;`,
+        [String(ttlMs)]
+      );
+      for (const r of rows) await releaseThread(r.thread_id);
+      if (rows.length) console.log(`[checkpoint] 兜底清理 ${rows.length} 个过期挂起检查点`);
+    } catch (err) {
+      console.warn('[checkpoint] sweeper 异常:', err.message);
+    }
+  }, intervalMs);
+  timer.unref?.();
+  return timer;
+}
 
 function summaryOf(resultText) {
   try {

@@ -10,7 +10,14 @@ import { Command } from '@langchain/langgraph';
 import { CITY_LIST, BRANCH_CITIES, CITY_INFO } from './data.js';
 import { startHumanSession, isHumanActive } from './session.js';
 import { DEEPSEEK_API_KEY } from './llm.js';
-import { buildAgentGraph, streamAgentTurn, releaseThread } from './graph.js';
+import {
+  buildAgentGraph,
+  streamAgentTurn,
+  releaseThread,
+  registerPendingThread,
+  unregisterPendingThread
+} from './graph.js';
+import * as slotstore from './slotstore.js';
 import * as store from './store.js';
 import {
   buildContext,
@@ -22,7 +29,6 @@ import {
 import { truncate, streamFixed } from './utils.js';
 
 const HISTORY_LIMIT = 20; // 构建 LLM 上下文时最多带的历史轮数
-const PENDING_SLOTS_TTL = 10 * 60 * 1000; // 槽位挂起有效期：超时后需重新提问
 
 const SYSTEM_PROMPT = `你是"小邮"，物流公司的智能客服助手，使用简体中文与用户交流。
 
@@ -72,42 +78,57 @@ function detectCityIntent(message) {
 }
 
 // ---------- 待补参队列 ----------
-// sessionId -> { threadId, intent, originalMessage, missing, createdAt }
-// threadId 非空表示"图已中断"，提交后走 Command 续跑；为空表示规则快速路径，提交后重新发起一轮对话。
-const pendingSlots = new Map();
+// 存储外置到 slotstore（Redis 原生 TTL + GETDEL 原子取出；未配 REDIS_URL 则进程内存降级）：
+//   sessionId -> { threadId, intent, originalMessage, missing, createdAt }
+//   threadId 非空表示"图已中断"，提交后走 Command 续跑；为空表示规则快速路径，提交后重新发起一轮对话。
+// 多实例收益：A 实例弹窗挂起 -> B 实例可提交续跑；重启不丢挂起；过期由 Redis TTL 原生保证。
 
-function discardPending(sessionId) {
-  const p = pendingSlots.get(sessionId);
+async function discardPending(sessionId) {
+  const p = await slotstore.getPending(sessionId);
   if (!p) return;
-  pendingSlots.delete(sessionId);
-  if (p.threadId) void releaseThread(p.threadId);
+  await slotstore.delPending(sessionId);
+  if (p.threadId) {
+    void releaseThread(p.threadId);
+    void unregisterPendingThread(p.threadId);
+  }
 }
 
-// 定期清理过期挂起（同时释放对应 thread 的检查点）
-const sweeper = setInterval(() => {
-  for (const [sessionId, p] of pendingSlots) {
-    if (Date.now() - p.createdAt > PENDING_SLOTS_TTL) discardPending(sessionId);
-  }
-}, 60_000);
-sweeper.unref?.();
-
-function takePending(sessionId, intent) {
-  const p = pendingSlots.get(sessionId);
+async function takePending(sessionId, intent) {
+  const p = await slotstore.takePending(sessionId); // 原子取出，防并发/跨实例重复提交
   if (!p || p.intent !== intent) {
     throw Object.assign(new Error('没有待补充的查询，请重新描述您的需求'), { status: 409 });
   }
-  if (Date.now() - p.createdAt > PENDING_SLOTS_TTL) {
-    discardPending(sessionId);
+  if (Date.now() - p.createdAt > slotstore.PENDING_SLOTS_TTL) {
+    if (p.threadId) {
+      void releaseThread(p.threadId);
+      void unregisterPendingThread(p.threadId);
+    }
     throw Object.assign(new Error('选择已超时，请重新描述您的需求'), { status: 410 });
   }
-  pendingSlots.delete(sessionId); // 原子取出，防重复提交
+  if (p.threadId) void unregisterPendingThread(p.threadId); // 提交成功：摘除注册表，检查点由本轮收尾释放
   return p;
 }
 
 // 只读探测：供路由在进入 SSE 前校验（返回 JSON 错误码）
-export function hasPendingSlots(sessionId, intent) {
-  const p = pendingSlots.get(sessionId);
-  return !!p && p.intent === intent && Date.now() - p.createdAt <= PENDING_SLOTS_TTL;
+export async function hasPendingSlots(sessionId, intent) {
+  const p = await slotstore.getPending(sessionId);
+  return !!p && p.intent === intent && Date.now() - p.createdAt <= slotstore.PENDING_SLOTS_TTL;
+}
+
+// ---------- 每进程并发闸 ----------
+// 防御性兜底：限制本进程同时在处理的 LLM 轮次（图执行 + 槽位续跑），防突发流量打爆上游。
+// 超限快速失败 429，与入口限流（ratelimit.js，跨实例共享窗口）构成两级防护。
+const MAX_CONCURRENT_TURNS = Number(process.env.MAX_CONCURRENT_TURNS) || 16;
+let activeTurns = 0;
+
+function acquireTurn() {
+  if (activeTurns >= MAX_CONCURRENT_TURNS) return false;
+  activeTurns += 1;
+  return true;
+}
+
+function releaseTurn() {
+  activeTurns -= 1;
 }
 
 // ---------- 上下文拼装 ----------
@@ -136,16 +157,19 @@ async function runGraphTurn({ sessionId, userId, send, originalMessage, userMess
   try {
     const { text, interrupted } = await streamAgentTurn({ graph, input, threadId, send });
 
-    // 图被 interrupt() 挂起：记住 thread，等前端弹窗补参后 Command 续跑
+    // 图被 interrupt() 挂起：登记 thread（检查点已落 PostgreSQL，可跨实例续跑），等前端弹窗补参
     if (interrupted && interrupted.intent) {
       keepThread = true;
-      pendingSlots.set(sessionId, {
+      // 注册表先行：无论后续 Redis 写入成败，残留检查点都能被 sweeper 兜底释放
+      await registerPendingThread(threadId, sessionId);
+      const stored = await slotstore.putPending(sessionId, {
         threadId,
         intent: interrupted.intent,
         originalMessage,
         missing: interrupted.missing || [],
         createdAt: Date.now()
       });
+      if (!stored) console.warn('[slots] 进程挂起登记已达上限，弹窗提交可能不可用（容量保护）');
       send('ask_location', {
         intent: interrupted.intent,
         missing: interrupted.missing || [],
@@ -188,7 +212,7 @@ async function finishTurn({ sessionId, userId, send, text, userMessage }) {
 }
 
 // ---------- 入口：用户发消息 ----------
-export async function handleAgentMessage({ sessionId, message, userId, send }) {
+async function handleAgentMessageInner({ sessionId, message, userId, send }) {
   // 先持久化用户消息，再从存储构建上下文
   await store.appendMessage(sessionId, { role: 'user', content: message });
 
@@ -208,19 +232,22 @@ export async function handleAgentMessage({ sessionId, message, userId, send }) {
   }
 
   // 上一轮遗留的弹窗（用户没补参直接问了新问题）作废，避免悬挂的检查点泄漏
-  discardPending(sessionId);
+  await discardPending(sessionId);
 
   // 确定性意图识别快速路径：意图明确但缺城市 -> 挂起并弹窗，不经 LLM
   const fastIntent = detectCityIntent(message);
   if (fastIntent) {
     const memFact = await recallFact(userId, 'attribute', 'origin_city');
-    pendingSlots.set(sessionId, {
+    const stored = await slotstore.putPending(sessionId, {
       threadId: null, // 未进图：提交后按补全结果重新发起一轮对话
       intent: fastIntent,
       originalMessage: message,
       missing: fastIntent === 'query_freight' ? ['destination'] : ['city'],
       createdAt: Date.now()
     });
+    if (!stored) {
+      throw Object.assign(new Error('当前咨询人数较多，请稍后再试'), { status: 503 });
+    }
     send('status', {
       step: 'intent',
       label: `意图：${fastIntent === 'query_freight' ? '查运费时效（缺城市）' : '查网点（缺城市）'}`,
@@ -239,6 +266,18 @@ export async function handleAgentMessage({ sessionId, message, userId, send }) {
   await runGraphTurn({ sessionId, userId, send, originalMessage: message, userMessage: message });
 }
 
+// 对外入口统一过并发闸（转人工快速路径不经 LLM，也一并计数，保证总量受控）
+export async function handleAgentMessage(opts) {
+  if (!acquireTurn()) {
+    throw Object.assign(new Error('当前咨询人数较多，请稍后再试'), { status: 429 });
+  }
+  try {
+    return await handleAgentMessageInner(opts);
+  } finally {
+    releaseTurn();
+  }
+}
+
 // ---------- 槽位补全（弹窗选地址后恢复执行） ----------
 function slotText(intent, s) {
   return intent === 'query_freight'
@@ -247,29 +286,36 @@ function slotText(intent, s) {
 }
 
 export async function handleSlotSubmit({ sessionId, intent, slots, userId, send }) {
-  const pending = takePending(sessionId, intent);
-  const s = slots || {};
-  const desc = slotText(intent, s);
-  const mergedUserText = `${pending.originalMessage}（已选择：${desc}）`;
-
-  send('status', { step: 'slots', label: '已收到地址选择', detail: truncate(desc, 40), state: 'done' });
-  await store.appendMessage(sessionId, { role: 'user', content: mergedUserText });
-
-  if (pending.threadId) {
-    // 图已中断：用 Command 从断点续跑（工具重跑一次、拿到所选值后继续调用模型）
-    await runGraphTurn({
-      sessionId,
-      userId,
-      send,
-      originalMessage: pending.originalMessage,
-      userMessage: mergedUserText,
-      resume: { threadId: pending.threadId, slots: s }
-    });
-    return;
+  if (!acquireTurn()) {
+    throw Object.assign(new Error('当前咨询人数较多，请稍后再试'), { status: 429 });
   }
+  try {
+    const pending = await takePending(sessionId, intent);
+    const s = slots || {};
+    const desc = slotText(intent, s);
+    const mergedUserText = `${pending.originalMessage}（已选择：${desc}）`;
 
-  // 规则快速路径：把补全后的地址并入用户消息，重新走一轮图（工具参数仍由 LLM 抽取）
-  await runGraphTurn({ sessionId, userId, send, originalMessage: pending.originalMessage, userMessage: mergedUserText });
+    send('status', { step: 'slots', label: '已收到地址选择', detail: truncate(desc, 40), state: 'done' });
+    await store.appendMessage(sessionId, { role: 'user', content: mergedUserText });
+
+    if (pending.threadId) {
+      // 图已中断：用 Command 从断点续跑（检查点在 PostgreSQL，任意实例均可接手）
+      await runGraphTurn({
+        sessionId,
+        userId,
+        send,
+        originalMessage: pending.originalMessage,
+        userMessage: mergedUserText,
+        resume: { threadId: pending.threadId, slots: s }
+      });
+      return;
+    }
+
+    // 规则快速路径：把补全后的地址并入用户消息，重新走一轮图（工具参数仍由 LLM 抽取）
+    await runGraphTurn({ sessionId, userId, send, originalMessage: pending.originalMessage, userMessage: mergedUserText });
+  } finally {
+    releaseTurn();
+  }
 }
 
 // 弹窗下拉数据源

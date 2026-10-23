@@ -115,3 +115,27 @@ export async function setHumanState(sessionId, human) {
     updatedAt: s.human_updated_at
   };
 }
+
+/**
+ * 排队 -> 接入的 CAS 更新：仅当会话仍处于 queued 时才激活为 active。
+ * 多实例部署（或重启恢复竞态）下保证只有一个实例完成接入推送，避免重复欢迎语/分配事件。
+ * @returns 是否抢占成功（false = 已被其他实例接入或状态已流转）
+ */
+export async function activateHumanQueued(sessionId, agent, joinAt) {
+  // agent 兼容两种形态：{ id } / { name, code }，统一解析为客服 id
+  let agentId = agent?.id ?? null;
+  if (!agentId && agent?.code) {
+    const { rows } = await pool.query(`SELECT id FROM support_human WHERE code = $1;`, [agent.code]);
+    agentId = rows[0]?.id ?? null;
+  }
+  const { rowCount } = await pool.query(
+    `UPDATE chat_sessions SET
+       human_status = 'active',
+       human_agent_id = $2,
+       human_join_at = COALESCE($3, human_join_at),
+       human_updated_at = $4
+     WHERE session_id = $1 AND human_status = 'queued';`,
+    [sessionId, agentId, joinAt ?? null, Date.now()]
+  );
+  return rowCount > 0;
+}

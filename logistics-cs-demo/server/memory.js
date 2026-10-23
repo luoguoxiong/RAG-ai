@@ -10,7 +10,7 @@ import { createLlm } from './llm.js';
 import * as memstore from './memstore.js';
 import * as memjobs from './memjobs.js';
 import * as store from './store.js';
-import { pushEvent } from './session.js';
+import { pushSessionEvent as pushEvent } from './session.js';
 
 const EXTRACT_DEBOUNCE_MS = 10_000; // 提取去抖窗口：窗口内多轮合并成一次 LLM 调用
 const IDLE_SUMMARY_MS = 30 * 60 * 1000; // 会话空闲 30 分钟后生成情景摘要（L1）

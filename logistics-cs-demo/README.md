@@ -18,7 +18,7 @@ LLM（deepseek-chat）根据用户问题自主决策，调用 5 个工具：
 - 支持**多轮对话记忆**：第二轮"那换成 5 公斤呢？"会自动继承上一轮的城市上下文
 - Agent 过程（思考 -> 决定调用工具 -> 工具结果 -> 回复）以"过程徽章"实时展示，回复逐 token 流式输出
 - 未提供运单号/目的地时，LLM 会先追问而不是瞎调工具
-- **意图识别 + 槽位补全弹窗**：工具发现缺城市参数时在节点内 `interrupt()` 挂起整张图（断点存 `MemorySaver`），服务端推送 `ask_location` 事件，前端**弹窗选择地址**（寄出城市自动预填长期记忆的常用城市）后提交 `POST /api/chat/slots`，用 `Command({ resume })` 续跑——工具重跑一次拿到用户选择，再交 LLM 生成回答，替代纯文字追问；表述里完全没有城市的常见问法（如"帮我查下运费"）另有一条不经 LLM 的规则快速路径
+- **意图识别 + 槽位补全弹窗**：工具发现缺城市参数时在节点内 `interrupt()` 挂起整张图（断点存 PostgreSQL checkpointer），服务端推送 `ask_location` 事件，前端**弹窗选择地址**（寄出城市自动预填长期记忆的常用城市）后提交 `POST /api/chat/slots`，用 `Command({ resume })` 续跑——工具重跑一次拿到用户选择，再交 LLM 生成回答，替代纯文字追问；表述里完全没有城市的常见问法（如"帮我查下运费"）另有一条不经 LLM 的规则快速路径
 - **长期记忆**：跨会话记住用户画像与偏好（常用寄出城市、业务身份、偏好档位等），带完整的更新策略（置信度合并、冲突消解、时间衰减、用户纠正、可遗忘）—— 设计详见 [docs/long-term-memory-design.md](docs/long-term-memory-design.md)
 
 ## 运行
@@ -37,11 +37,31 @@ DEEPSEEK_MODEL=deepseek-chat
 DATABASE_URL=postgres://postgres:postgres@localhost:5432/logistics_cs
 ```
 
-需要可用的 PostgreSQL（>= 13）。服务启动时自动建表（`chat_sessions` / `chat_messages` / `support_human`）并写入种子客服（林晓 / CS1024），首次运行前先创建数据库：
+需要可用的 PostgreSQL（>= 13）。服务启动时自动建表（业务表 + LangGraph checkpoint* 表 + 挂起注册表）并写入种子客服（林晓 / CS1024），首次运行前先创建数据库：
 
 ```bash
 createdb logistics_cs   # 或: psql -c "CREATE DATABASE logistics_cs;"
 ```
+
+### Redis（可选，多实例部署推荐开启）
+
+```bash
+docker compose up -d redis   # 项目自带 compose，映射 127.0.0.1:6390（避开常见 6379 占用）
+```
+
+`.env` 配置 `REDIS_URL=redis://127.0.0.1:6390/0` 后，**挂起槽位 / 会话级 SSE 事件总线 / 入口限流窗口 / 客服在线状态**全部走 Redis：进程无状态、可任意横向扩展、重启不丢挂起、TTL 由 Redis 原生保证。不配置则自动降级为进程内存实现（单机演示模式，行为一致）。
+
+### 多实例横向扩展
+
+状态全部外置（Redis + PostgreSQL）后，Node 进程无状态，起几个都行：
+
+```bash
+PORT=3001 node server/index.js &
+PORT=3002 node server/index.js &
+# 前面挂任意负载均衡（nginx / 云 LB），无需粘性会话
+```
+
+跨实例能力已验证：A 实例弹窗挂起 -> B 实例提交续跑（挂起在 Redis、检查点在 PG）；B 实例触发转人工 -> A 实例持有的用户 SSE 实时收到事件（Redis pub/sub 桥接）；任一实例重启不丢挂起与人工会话状态。
 
 ## 演示话术
 
@@ -68,14 +88,18 @@ public/                  前端（原生 HTML/CSS/JS，无构建）
   agent.css              工作台补充样式
   style.css              样式
 server/
-  index.js               Express 入口：静态资源 + 路由（启动时自动建表）
+  index.js               Express 入口：静态资源 + 路由 + 启动装配（建表/checkpoint 迁移/worker/总线/心跳）
   db.js                   PostgreSQL 连接池 + 建表 + 种子客服
-  agent.js               会话编排：上下文拼装（Prompt + 长期记忆 + 历史）/ 转人工快速路径 / 槽位补全 / 落库与记忆调度
-  graph.js               LangGraph Agent：StateGraph(agent ⇄ tools) + ToolNode + interrupt 槽位补全 + 流式事件映射
+  agent.js               会话编排：上下文拼装（Prompt + 长期记忆 + 历史）/ 转人工快速路径 / 槽位补全 / 落库与记忆调度 + 每进程并发闸
+  graph.js               LangGraph Agent：StateGraph(agent ⇄ tools) + ToolNode + interrupt 槽位补全 + 流式事件映射；PostgresSaver 检查点 + 挂起 thread 注册表/兜底清理
   llm.js                 ChatDeepSeek 封装（读取 .env，temperature 可覆盖）
   tools.js               业务工具实现（运单/运费/知识库/网点）+ scoreKnowledge
   utils.js               通用小工具（消息取文本 / 截断 / 固定文案模拟流式）
-  session.js             会话级 SSE 通道 + 人工客服会话管理（排队/接入/应答，状态持久化、重启可恢复）
+  redis.js               Redis 接入（REDIS_URL 可选）：普通/订阅双连接，未配置则各模块降级进程内存
+  slotstore.js           挂起槽位存储：Redis 原生 TTL + GETDEL 原子取出（多实例共享），内存降级 + 每进程容量上限
+  ratelimit.js           入口限流：固定窗口（Redis INCR/PEXPIRE 跨实例共享 / 内存降级），限流器故障放行
+  bus.js                 会话级 SSE 事件总线：本地直写 + Redis pub/sub 跨实例桥接；客服在线状态心跳注册表
+  session.js             人工客服会话管理（排队/接入/应答，状态持久化、重启可恢复；CAS 接入防多实例重复推送）
   store.js               PostgreSQL 持久层：对话历史 + 人工会话状态存取（chat_sessions / chat_messages）
   memory.js              长期记忆：LLM 异步提取 + 合并更新策略 + 检索注入 + 会话摘要
   memstore.js            记忆持久层：PostgreSQL（memory_facts / memory_summaries，事务 + 用户级锁）
@@ -98,6 +122,7 @@ scripts/
 - `memory_facts(id PK, user_id, type, key, value JSONB, confidence, source, evidence, hits, status, history JSONB, created_at, updated_at, expires_at, archived_at)`，部分唯一索引 `(user_id, type, key) WHERE status='active'` 保证同键只有一条生效事实
 - `memory_summaries(id PK, user_id, session_id, summary, until_ts, ts)`，唯一索引 `(user_id, session_id)`
 - `memory_jobs(id PK, kind, dedupe_key, user_id, session_id, payload JSONB, status, run_at, attempts, last_error)`，部分唯一索引 `(dedupe_key) WHERE status='pending'` 做去抖合并
+- `pending_threads(thread_id PK, session_id, created_ts)` —— LangGraph 挂起 thread 注册表：挂起槽位本体在 Redis（TTL 过期），注册表保证过期挂起的检查点仍能被 sweeper 兜底释放；另有 PostgresSaver 自动建的三张表 `checkpoints` / `checkpoint_blobs` / `checkpoint_writes`（+ 迁移表）
 
 **记忆并发与可靠性（生产化）**：所有"读-改-写"都在 `withUserLock` 事务内执行，用 `pg_advisory_xact_lock(user_id)` 串行化同一用户、提交前按 id 做 diff 精确落盘（不再整文件重写）；命中计数走原子 SQL。异步提取不再用进程内 `setTimeout`，而是写入 `memory_jobs`：同一 `dedupe_key` 的 pending 任务合并 payload 并推迟 `run_at`（等价于 10s 去抖），worker 用 `FOR UPDATE SKIP LOCKED` 认领、按用户级 advisory lock 串行执行、失败指数退避重试 3 次后置 `dead`，进程崩溃留下的 `running` 任务超过 5 分钟租约自动回收。多实例部署时任务不会被重复消费。
 
@@ -113,7 +138,7 @@ START → agent（DeepSeek 决策）─┬─ 有 tool_calls → tools（ToolNod
 - 图状态只有 `messages`（官方 `messagesStateReducer` 增量合并）；模型用 `bindTools` 绑定 5 个工具，条件边用官方 `toolsCondition` 判断是否进入 `ToolNode`——原来的手写 ReAct 循环整段消失
 - 工具轮次用 `recursionLimit`（12 步 ≈ 4~5 轮工具调用）约束，超限时收口本轮而不是报错
 - **流式**：`graph.stream(input, { streamMode: ['updates', 'messages'] })`——`messages` 流只取 `agent` 节点的 token 增量推成 `delta` 事件；`updates` 流拿节点级更新与 `__interrupt__`。工具内部把调用/结果写成 `status` 徽章，SSE 协议与重构前一致（前端零改动）
-- **中断式槽位补全**：`query_freight` / `query_branches` 缺参时在工具内 `interrupt({ intent, missing, preset, originMemory })` 挂起图，`MemorySaver` 按 `thread_id` 保存断点（一个用户轮次一个 thread）；前端弹窗提交后用 `Command({ resume })` 续跑，工具重跑时 `interrupt()` 直接返回用户选择。弹窗作废 / 超时（10 分钟）会释放对应 thread，内存不留垃圾
+- **中断式槽位补全**：`query_freight` / `query_branches` 缺参时在工具内 `interrupt({ intent, missing, preset, originMemory })` 挂起图，检查点经 **PostgresSaver** 按 `thread_id` 落 PostgreSQL（一个用户轮次一个 thread，多实例共享、重启不丢）；前端弹窗提交后用 `Command({ resume })` 续跑，工具重跑时 `interrupt()` 直接返回用户选择。挂起槽位本体在 Redis（10 分钟原生 TTL、GETDEL 原子取出防重复提交）；弹窗作废/超时即时释放检查点，用户放弃弹窗的残留由 `pending_threads` 注册表 + sweeper 兜底清理，PG 不留垃圾
 - **对话历史仍以 PostgreSQL 为准**：每轮从库里重建 `SystemPrompt + 长期记忆 + 最近 20 条历史` 作为图输入；检查点只服务中断续跑，所以服务重启后对话上下文照旧可恢复
 
 ## SSE 协议
@@ -161,5 +186,5 @@ START → agent（DeepSeek 决策）─┬─ 有 tool_calls → tools（ToolNod
 
 - `tools.js`：把 mock 实现换成真实轨迹 API、计价引擎、向量检索（RAG）、网点目录服务（POI）；工具签名（zod schema）不变，LLM 侧无需改动
 - `llm.js`：更换模型只需改 `DEEPSEEK_MODEL`，或把 ChatDeepSeek 换成其他 ChatModel
-- `graph.js`：换更复杂的编排（多 Agent 协作、子图、审批节点）只需改 `StateGraph` 的节点与边；接生产可把 `MemorySaver` 换成持久化 checkpointer（Postgres/Redis），thread 就能跨重启续跑
+- `graph.js`：换更复杂的编排（多 Agent 协作、子图、审批节点）只需改 `StateGraph` 的节点与边；检查点已是持久化 PostgresSaver，thread 天然跨重启/跨实例续跑
 - `session.js`：人工客服替换为真实客服工单系统（WebSocket / IM 网关）

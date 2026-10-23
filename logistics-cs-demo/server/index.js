@@ -5,10 +5,12 @@ import express from 'express';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { initDb, pool } from './db.js';
+import { initCheckpointer, startCheckpointSweeper } from './graph.js';
 import { handleAgentMessage, handleSlotSubmit, hasPendingSlots, getCityOptions } from './agent.js';
+import { rateLimit } from './ratelimit.js';
+import { addChannel, addAgentChannel, initBus, startPresenceHeartbeat, closeBus } from './bus.js';
+import { isRedisMode, quitRedis } from './redis.js';
 import {
-  addChannel,
-  addAgentChannel,
   humanUserMessage,
   startHumanSession,
   endHumanSession,
@@ -54,7 +56,8 @@ app.get('/api/events', (req, res) => {
 
 // 聊天：请求级 SSE 流式返回 Agent 处理过程与回复
 // userId：前端 localStorage 生成的长期记忆命名空间（可选，缺省则仅会话内记忆）
-app.post('/api/chat', async (req, res) => {
+// 入口限流：单 IP 每分钟请求数上限（跨实例共享窗口；RATE_LIMIT_PER_MIN=0 关闭）
+app.post('/api/chat', rateLimit({ name: 'chat' }), async (req, res) => {
   const { sessionId, message, userId } = req.body || {};
   if (!sessionId || !String(message || '').trim()) {
     res.status(400).json({ error: 'sessionId 与 message 必填' });
@@ -78,14 +81,14 @@ app.post('/api/chat', async (req, res) => {
 });
 
 // 意图识别槽位补全：LLM 识别意图但缺城市参数时挂起，前端弹窗选地址后提交至此恢复执行
-// 挂起校验放在进入 SSE 前，业务拒绝可直接返回 JSON 状态码
-app.post('/api/chat/slots', async (req, res) => {
+// 挂起校验放在进入 SSE 前，业务拒绝可直接返回 JSON 状态码（挂起状态在 Redis/内存存储中，任意实例可校验）
+app.post('/api/chat/slots', rateLimit({ name: 'slots' }), async (req, res) => {
   const { sessionId, intent, slots, userId } = req.body || {};
   if (!sessionId || !intent) {
     res.status(400).json({ error: 'sessionId 与 intent 必填' });
     return;
   }
-  if (!hasPendingSlots(sessionId, intent)) {
+  if (!(await hasPendingSlots(sessionId, intent))) {
     res.status(409).json({ error: 'no_pending_slots', message: '没有待补充的查询，请重新描述您的需求' });
     return;
   }
@@ -320,10 +323,16 @@ app.post('/api/memory/forget', async (req, res) => {
 
 const PORT = Number(process.env.PORT) || 3000;
 
-// 启动前先完成建表（会话 / 消息 / 记忆 / 任务队列）与种子客服，再拉起记忆任务 worker
+// 启动顺序：PG 建表 -> checkpoint 表迁移（PostgresSaver.setup）-> 后台任务（记忆 worker /
+// 挂起检查点兜底清理）-> SSE 总线/客服在线心跳 -> 监听端口
 initDb()
+  .then(() => initCheckpointer())
   .then(() => {
+    startCheckpointSweeper();
     startMemoryWorker();
+    initBus();
+    startPresenceHeartbeat();
+    console.log(`[server] 状态后端: ${isRedisMode() ? 'Redis（多实例就绪）' : '进程内存（单机模式，配置 REDIS_URL 可横向扩展）'}`);
     app.listen(PORT, () => {
       console.log(`[物流智能客服 demo] 已启动: http://localhost:${PORT}`);
     });
@@ -333,11 +342,15 @@ initDb()
     process.exit(1);
   });
 
-// 优雅退出：停掉 worker 并释放连接池，避免任务在滚动发布时被硬杀
+// 优雅退出：停掉 worker / 总线心跳 / Redis 连接并释放连接池，避免任务在滚动发布时被硬杀
 for (const signal of ['SIGINT', 'SIGTERM']) {
   process.on(signal, () => {
     console.log(`[server] 收到 ${signal}，正在关闭...`);
     stopMemoryWorker();
-    pool.end().finally(() => process.exit(0));
+    closeBus();
+    pool
+      .end()
+      .catch(() => {})
+      .finally(() => quitRedis().finally(() => process.exit(0)));
   });
 }

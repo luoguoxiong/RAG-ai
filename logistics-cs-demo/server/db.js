@@ -128,6 +128,17 @@ export async function initDb() {
       ON memory_jobs (status, run_at);
   `);
 
+  // 挂起 thread 注册表：LangGraph 检查点（checkpoint* 表）的兜底清理登记。
+  // 挂起槽位本体在 Redis（TTL 过期），注册表保证"过期的挂起"仍能找到并释放对应检查点
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS pending_threads (
+      thread_id  TEXT PRIMARY KEY,
+      session_id TEXT NOT NULL,
+      created_ts TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS idx_pending_threads_created ON pending_threads (created_ts);
+  `);
+
   // 种子客服数据：demo 的 mock 客服（已存在则跳过）
   await pool.query(
     `INSERT INTO support_human (name, code, status)
