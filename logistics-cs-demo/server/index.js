@@ -10,6 +10,7 @@ import { handleAgentMessage, handleSlotSubmit, hasPendingSlots, getCityOptions }
 import { rateLimit } from './ratelimit.js';
 import { addChannel, addAgentChannel, initBus, startPresenceHeartbeat, closeBus } from './bus.js';
 import { isRedisMode, quitRedis } from './redis.js';
+import { claim, complete, fail, makeResultRecorder, replayResult } from './idempotency.js';
 import {
   humanUserMessage,
   startHumanSession,
@@ -56,9 +57,11 @@ app.get('/api/events', (req, res) => {
 
 // 聊天：请求级 SSE 流式返回 Agent 处理过程与回复
 // userId：前端 localStorage 生成的长期记忆命名空间（可选，缺省则仅会话内记忆）
+// msgId：前端生成的消息幂等键（可选）——服务端 SETNX 认领，同 id 重复请求
+//        正在执行时 409 快速失败，已完成时直接重放第一次的结果（不重复跑 LLM/落库）
 // 入口限流：单 IP 每分钟请求数上限（跨实例共享窗口；RATE_LIMIT_PER_MIN=0 关闭）
 app.post('/api/chat', rateLimit({ name: 'chat' }), async (req, res) => {
-  const { sessionId, message, userId } = req.body || {};
+  const { sessionId, message, userId, msgId } = req.body || {};
   if (!sessionId || !String(message || '').trim()) {
     res.status(400).json({ error: 'sessionId 与 message 必填' });
     return;
@@ -68,22 +71,38 @@ app.post('/api/chat', rateLimit({ name: 'chat' }), async (req, res) => {
     return;
   }
 
+  // 服务端幂等：进入 SSE 前判重（业务拒绝可直接返回 JSON 状态码）
+  const claimRes = await claim(msgId);
+  if (claimRes.status === 'processing') {
+    res.status(409).json({ error: 'duplicate_request', message: '该消息正在处理中，请勿重复提交' });
+    return;
+  }
+  if (claimRes.status === 'replay') {
+    replayResult(res, claimRes.result); // 幂等窗口内的重复请求：重放第一次的结果
+    return;
+  }
+
   res.writeHead(200, SSE_HEADERS);
-  const send = (event, data) => res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
-  send('start', { ts: Date.now() });
+  const recorder = makeResultRecorder(
+    (event, data) => res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`)
+  );
+  recorder.send('start', { ts: Date.now() });
   try {
-    await handleAgentMessage({ sessionId, message: String(message).trim(), userId: userId ? String(userId) : '', send });
+    await handleAgentMessage({ sessionId, message: String(message).trim(), userId: userId ? String(userId) : '', send: recorder.send });
+    await complete(msgId, { events: recorder.events }); // 成功：结果回写，供同 id 重复请求重放
   } catch (err) {
     console.error('[chat] 处理异常:', err);
-    send('error', { message: err?.message || '服务处理异常，请稍后重试' });
+    void fail(msgId); // 失败：释放幂等占位，允许客户端用同一 msgId 重试
+    recorder.send('error', { message: err?.message || '服务处理异常，请稍后重试' });
   }
   res.end();
 });
 
 // 意图识别槽位补全：LLM 识别意图但缺城市参数时挂起，前端弹窗选地址后提交至此恢复执行
 // 挂起校验放在进入 SSE 前，业务拒绝可直接返回 JSON 状态码（挂起状态在 Redis/内存存储中，任意实例可校验）
+// msgId：与 /api/chat 同源幂等键——同 id 重复提交（网络重试/多端登录）直接重放或快速失败
 app.post('/api/chat/slots', rateLimit({ name: 'slots' }), async (req, res) => {
-  const { sessionId, intent, slots, userId } = req.body || {};
+  const { sessionId, intent, slots, userId, msgId } = req.body || {};
   if (!sessionId || !intent) {
     res.status(400).json({ error: 'sessionId 与 intent 必填' });
     return;
@@ -93,14 +112,29 @@ app.post('/api/chat/slots', rateLimit({ name: 'slots' }), async (req, res) => {
     return;
   }
 
+  // 服务端幂等：进入 SSE 前判重（注意 hasPendingSlots 已校验，重复提交会先命中 here）
+  const claimRes = await claim(msgId);
+  if (claimRes.status === 'processing') {
+    res.status(409).json({ error: 'duplicate_request', message: '该提交正在处理中，请勿重复提交' });
+    return;
+  }
+  if (claimRes.status === 'replay') {
+    replayResult(res, claimRes.result);
+    return;
+  }
+
   res.writeHead(200, SSE_HEADERS);
-  const send = (event, data) => res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
-  send('start', { ts: Date.now() });
+  const recorder = makeResultRecorder(
+    (event, data) => res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`)
+  );
+  recorder.send('start', { ts: Date.now() });
   try {
-    await handleSlotSubmit({ sessionId, intent, slots: slots || {}, userId: userId ? String(userId) : '', send });
+    await handleSlotSubmit({ sessionId, intent, slots: slots || {}, userId: userId ? String(userId) : '', send: recorder.send });
+    await complete(msgId, { events: recorder.events });
   } catch (err) {
     console.error('[slots] 处理异常:', err);
-    send('error', { message: err?.message || '服务处理异常，请稍后重试' });
+    void fail(msgId);
+    recorder.send('error', { message: err?.message || '服务处理异常，请稍后重试' });
   }
   res.end();
 });

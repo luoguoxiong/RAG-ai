@@ -60,6 +60,12 @@ function genId(prefix) {
     ? `${prefix}-${crypto.randomUUID().slice(0, 12)}`
     : `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 }
+// 消息级幂等键：每条用户消息一个，服务端据 SETNX 认领、重复请求重放第一次结果
+function newMsgId() {
+  return (typeof crypto !== 'undefined' && crypto.randomUUID)
+    ? crypto.randomUUID()
+    : genId('m');
+}
 
 /* ---------- 渲染工具 ---------- */
 function escapeHtml(s) {
@@ -234,11 +240,15 @@ async function streamAgentReply(url, body, { traceEl, bubble, ctx }) {
   });
   if (!res.ok) {
     let msg = `请求失败（HTTP ${res.status}）`;
+    let code = '';
     try {
       const j = await res.json();
       if (j.message) msg = j.message;
+      if (j.error) code = j.error;
     } catch { /* ignore */ }
-    throw new Error(msg);
+    const e = new Error(msg);
+    e.code = code;
+    throw e;
   }
 
   const reader = res.body.getReader();
@@ -273,11 +283,15 @@ async function sendMessage(text) {
   try {
     await streamAgentReply(
       '/api/chat',
-      { sessionId: state.sessionId, message: text, userId: state.userId },
+      { sessionId: state.sessionId, message: text, userId: state.userId, msgId: newMsgId() },
       { traceEl, bubble, ctx }
     );
   } catch (err) {
-    bubble.innerHTML = md(`抱歉，请求出现异常：${err.message}。请稍后重试，或输入"转人工"。`);
+    if (err.code === 'duplicate_request') {
+      bubble.innerHTML = md('该消息正在处理中，已忽略重复提交。');
+    } else {
+      bubble.innerHTML = md(`抱歉，请求出现异常：${err.message}。请稍后重试，或输入"转人工"。`);
+    }
   } finally {
     state.busy = false;
     setInputEnabled(true);
@@ -665,11 +679,15 @@ async function submitSlots() {
   try {
     await streamAgentReply(
       '/api/chat/slots',
-      { sessionId: state.sessionId, intent, slots, userId: state.userId },
+      { sessionId: state.sessionId, intent, slots, userId: state.userId, msgId: newMsgId() },
       { traceEl, bubble, ctx }
     );
   } catch (err) {
-    bubble.innerHTML = md(`提交失败：${err.message}。请重新描述您的需求。`);
+    if (err.code === 'duplicate_request') {
+      bubble.innerHTML = md('该提交正在处理中，已忽略重复提交。');
+    } else {
+      bubble.innerHTML = md(`提交失败：${err.message}。请重新描述您的需求。`);
+    }
   } finally {
     state.busy = false;
     setInputEnabled(true);

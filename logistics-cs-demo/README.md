@@ -98,6 +98,7 @@ server/
   redis.js               Redis 接入（REDIS_URL 可选）：普通/订阅双连接，未配置则各模块降级进程内存
   slotstore.js           挂起槽位存储：Redis 原生 TTL + GETDEL 原子取出（多实例共享），内存降级 + 每进程容量上限
   ratelimit.js           入口限流：固定窗口（Redis INCR/PEXPIRE 跨实例共享 / 内存降级），限流器故障放行
+  idempotency.js         服务端幂等：消息级幂等键（客户端生成 msgId），Redis SETNX 认领 + 结果回写重放 / 内存降级；重复请求直接重放第一次结果，失败释放允许重试
   bus.js                 会话级 SSE 事件总线：本地直写 + Redis pub/sub 跨实例桥接；客服在线状态心跳注册表
   session.js             人工客服会话管理（排队/接入/应答，状态持久化、重启可恢复；CAS 接入防多实例重复推送）
   store.js               PostgreSQL 持久层：对话历史 + 人工会话状态存取（chat_sessions / chat_messages）
@@ -140,6 +141,16 @@ START → agent（DeepSeek 决策）─┬─ 有 tool_calls → tools（ToolNod
 - **流式**：`graph.stream(input, { streamMode: ['updates', 'messages'] })`——`messages` 流只取 `agent` 节点的 token 增量推成 `delta` 事件；`updates` 流拿节点级更新与 `__interrupt__`。工具内部把调用/结果写成 `status` 徽章，SSE 协议与重构前一致（前端零改动）
 - **中断式槽位补全**：`query_freight` / `query_branches` 缺参时在工具内 `interrupt({ intent, missing, preset, originMemory })` 挂起图，检查点经 **PostgresSaver** 按 `thread_id` 落 PostgreSQL（一个用户轮次一个 thread，多实例共享、重启不丢）；前端弹窗提交后用 `Command({ resume })` 续跑，工具重跑时 `interrupt()` 直接返回用户选择。挂起槽位本体在 Redis（10 分钟原生 TTL、GETDEL 原子取出防重复提交）；弹窗作废/超时即时释放检查点，用户放弃弹窗的残留由 `pending_threads` 注册表 + sweeper 兜底清理，PG 不留垃圾
 - **对话历史仍以 PostgreSQL 为准**：每轮从库里重建 `SystemPrompt + 长期记忆 + 最近 20 条历史` 作为图输入；检查点只服务中断续跑，所以服务重启后对话上下文照旧可恢复
+
+## 防重复提交（分层）
+
+| 层级 | 手段 | 防住什么 | 防不住什么 |
+| --- | --- | --- | --- |
+| 前端 | `state.busy` 锁 | 同一页面连点、误触 | 网络重试、页面双开、多端登录 |
+| 槽位粒度 | Redis `GETDEL` 原子取出 | 槽位补全的并发/跨实例重复提交 | 普通聊天消息的重复请求 |
+| **服务端幂等键** | 客户端 `msgId` + Redis `SETNX msgId PX ttl` / 内存降级 | 真正的消息级幂等：同 id 重复请求在进 SSE 前被 `409` 拦下，已完成的直接重放第一次结果（不再跑 LLM/落库/记忆提取）；执行失败释放占位允许携带同 id 重试 | —— |
+
+前端锁、槽位 `GETDEL`、服务端幂等键三者分层清晰、各管一段。幂等键以客户端生成的 `msgId` 为准，服务端 `SET` 占位（`NX`）抢占，成功后把可重放 SSE 事件序列（增量 token 已合并为整段）写回同 key 并重置 TTL；Redis 故障按"可用性优先"放行（退化为无幂等，不影响正常请求）。
 
 ## SSE 协议
 
