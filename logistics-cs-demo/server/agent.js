@@ -7,7 +7,7 @@
 import { randomUUID } from 'node:crypto';
 import { AIMessage, HumanMessage, SystemMessage } from '@langchain/core/messages';
 import { Command } from '@langchain/langgraph';
-import { CITY_LIST, BRANCH_CITIES } from './data.js';
+import { CITY_LIST, BRANCH_CITIES, CITY_INFO } from './data.js';
 import { startHumanSession, isHumanActive } from './session.js';
 import { DEEPSEEK_API_KEY } from './llm.js';
 import { buildAgentGraph, streamAgentTurn, releaseThread } from './graph.js';
@@ -54,9 +54,18 @@ function isExplicitTransferRequest(message) {
 const BRANCH_INTENT_RE = /网点|营业点|门店|自提点|驿站|营业厅/;
 const FREIGHT_INTENT_RE =
   /运费|邮费|快递费|多少钱|几块钱|怎么收费|价格|时效|几天到|多久到|几天能到|多久能到|寄东西|寄快递|发快递|寄件/;
+// 政策咨询词优先于运费/网点判断：如"保价怎么收费"是知识库问题而非查运费，
+// 不能被"怎么收费"误触发缺城市弹窗
+const KNOWLEDGE_INTENT_RE =
+  /禁运|不能寄|可以寄|能寄吗|能寄|理赔|保价|包装|拒收|退回|节假日|上门取件|冷链|锂电池|充电宝/;
+// 省份名：提及省份视为"地点明确"（query_branches 支持按省检索），交给 LLM 直接调工具
+const PROVINCE_LIST = [...new Set(Object.values(CITY_INFO).map((c) => c.province))];
 function detectCityIntent(message) {
   const m = String(message || '');
-  if (CITY_LIST.some((c) => m.includes(c))) return null; // 含城市：交给 LLM 直接调工具
+  if (KNOWLEDGE_INTENT_RE.test(m)) return null; // 政策咨询：交给 LLM 调知识库工具
+  if (CITY_LIST.some((c) => m.includes(c)) || PROVINCE_LIST.some((p) => m.includes(p))) {
+    return null; // 含城市/省份：交给 LLM 直接调工具
+  }
   if (BRANCH_INTENT_RE.test(m)) return 'query_branches';
   if (FREIGHT_INTENT_RE.test(m)) return 'query_freight';
   return null;
