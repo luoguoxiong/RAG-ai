@@ -127,7 +127,7 @@ function buildTools({ sessionId, userId, send, originalMessage }) {
       let origin = args.origin;
       let memFact = null;
       if (!origin && userId) {
-        memFact = recallFact(userId, 'attribute', 'origin_city');
+        memFact = await recallFact(userId, 'attribute', 'origin_city');
         if (memFact) origin = memFact.value;
       }
 
@@ -154,7 +154,7 @@ function buildTools({ sessionId, userId, send, originalMessage }) {
 
       const result = await queryFreight({ origin, destination, weightKg });
       if (memFact) {
-        bumpFact(userId, memFact.id); // 命中：hits+1、confidence 微升
+        await bumpFact(userId, memFact.id); // 命中：hits+1、confidence 微升
         send('memory_used', factDisplay(memFact));
       }
       return JSON.stringify(result);

@@ -104,7 +104,7 @@ export function hasPendingSlots(sessionId, intent) {
 // ---------- 上下文拼装 ----------
 // 对话历史以 PostgreSQL 为准（含本轮刚写入的用户消息），每轮重新注入图状态
 async function buildSeedMessages({ sessionId, userId }) {
-  const memory = buildContext(userId);
+  const memory = await buildContext(userId); // PG 版记忆为异步读取
   const history = (await store.getMessages(sessionId))
     .filter((m) => m.role === 'user' || m.role === 'assistant')
     .slice(-HISTORY_LIMIT)
@@ -167,9 +167,12 @@ async function finishTurn({ sessionId, userId, send, text, userMessage }) {
     await startHumanSession(sessionId);
   }
 
+  // 长期记忆：任务入队（落库后由后台 worker 执行，不阻塞已结束的回复流）+ 刷新会话摘要空闲窗口
   if (userId) {
-    scheduleExtraction({ userId, sessionId, userMsg: userMessage, assistantMsg: text });
-    scheduleIdleSummary({ userId, sessionId });
+    await Promise.all([
+      scheduleExtraction({ userId, sessionId, userMsg: userMessage, assistantMsg: text }),
+      scheduleIdleSummary({ userId, sessionId })
+    ]).catch((err) => console.warn('[memory] 记忆任务入队失败:', err?.message || err));
   }
 
   send('done', { intent: 'llm', mode: 'agent' });
@@ -201,7 +204,7 @@ export async function handleAgentMessage({ sessionId, message, userId, send }) {
   // 确定性意图识别快速路径：意图明确但缺城市 -> 挂起并弹窗，不经 LLM
   const fastIntent = detectCityIntent(message);
   if (fastIntent) {
-    const memFact = recallFact(userId, 'attribute', 'origin_city');
+    const memFact = await recallFact(userId, 'attribute', 'origin_city');
     pendingSlots.set(sessionId, {
       threadId: null, // 未进图：提交后按补全结果重新发起一轮对话
       intent: fastIntent,
