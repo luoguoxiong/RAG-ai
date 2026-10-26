@@ -347,7 +347,8 @@ export function stopMemoryWorker() {
   return memjobs.stopWorker();
 }
 
-// 摘要已有更新的版本则跳过（以会话最后一条消息时间为基准去重）
+// 摘要已有更新的版本则跳过（以会话最后一条消息时间为基准去重）；
+// 增量式：在旧摘要基础上只合并 until_ts 之后的新消息，避免覆盖式重摘把 12 条窗口外的早期内容挤丢
 export async function summarizeSession({ userId, sessionId }) {
   const msgs = (await store.getMessages(sessionId)).filter((m) => m.role === 'user' || m.role === 'assistant');
   if (!msgs.length) return false;
@@ -355,16 +356,22 @@ export async function summarizeSession({ userId, sessionId }) {
   const existing = (await memstore.getSummaries(userId)).find((s) => s.sessionId === sessionId);
   if (existing && Number(existing.untilTs || 0) >= lastTs) return false;
 
+  const startTs = existing ? Number(existing.untilTs || 0) : 0;
+  const newMsgs = msgs.filter((m) => Number(m.ts || 0) > startTs);
+  if (!newMsgs.length) return false; // 理论不可达（lastTs > startTs），防御时钟异常
+
   const llm = createLlm({ temperature: 0, timeout: EXTRACT_TIMEOUT_MS });
-  const dialogueText = msgs
-    .slice(-12)
+  const dialogueText = newMsgs
+    .slice(-12) // 单次输入上限；增量语义下中间段丢失风险仅存在于任务长期积压的场景
     .map((m) => `${m.role === 'user' ? '用户' : '客服'}：${String(m.content).slice(0, 200)}`)
     .join('\n');
   const res = await llm.invoke([
     new SystemMessage(
-      '把物流客服对话压缩成一条不超过40字的中文摘要，包含关键实体（运单号/城市/问题），只输出摘要本身。'
+      existing
+        ? '你将看到一条旧会话摘要和其后新增的对话。把两者合并成一条不超过40字的中文摘要：保留关键实体（运单号/城市/问题）与未完结事项，旧摘要中仍相关的内容不得丢失，只输出摘要本身。'
+        : '把物流客服对话压缩成一条不超过40字的中文摘要，包含关键实体（运单号/城市/问题），只输出摘要本身。'
     ),
-    new HumanMessage(dialogueText)
+    new HumanMessage(existing ? `【旧摘要】\n${existing.summary}\n\n【新增对话】\n${dialogueText}` : dialogueText)
   ]);
   const summary = String(res.content ?? '').trim().slice(0, 60);
   if (!summary) return false;

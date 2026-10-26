@@ -227,7 +227,7 @@ flowchart LR
     RC --> LK["tryUserLock<br/>advisory_lock 键 memjob:userId"]
     LK -- "拿不到锁 requeue 3s" --> J
     LK --> EXT["extract：LLM 白名单提取<br/>8 组合 type.key ≤4 ops"]
-    LK --> SUM["summary：最近 12 条<br/>压缩 40 字摘要"]
+    LK --> SUM["summary：旧摘要+新增消息<br/>增量合并 40 字摘要"]
     EXT --> MU["memstore.mutateUser<br/>事务 + advisory_xact_lock + diff 落盘"]
     MU --> AO["applyOps 冲突消解<br/>score = confidence × recency 半衰期"]
     AO --> F[("memory_facts<br/>唯一索引 user+type+key active")]
