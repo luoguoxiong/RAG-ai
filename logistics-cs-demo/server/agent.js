@@ -157,6 +157,7 @@ async function runGraphTurn({ sessionId, userId, send, originalMessage, userMess
   try {
     const { text, interrupted } = await streamAgentTurn({ graph, input, threadId, send });
 
+    console.log('interrupted',interrupted)
     // 图被 interrupt() 挂起：登记 thread（检查点已落 PostgreSQL，可跨实例续跑），等前端弹窗补参
     if (interrupted && interrupted.intent) {
       keepThread = true;
@@ -235,33 +236,33 @@ async function handleAgentMessageInner({ sessionId, message, userId, send }) {
   await discardPending(sessionId);
 
   // 确定性意图识别快速路径：意图明确但缺城市 -> 挂起并弹窗，不经 LLM
-  const fastIntent = detectCityIntent(message);
-  if (fastIntent) {
-    const memFact = await recallFact(userId, 'attribute', 'origin_city');
-    const stored = await slotstore.putPending(sessionId, {
-      threadId: null, // 未进图：提交后按补全结果重新发起一轮对话
-      intent: fastIntent,
-      originalMessage: message,
-      missing: fastIntent === 'query_freight' ? ['destination'] : ['city'],
-      createdAt: Date.now()
-    });
-    if (!stored) {
-      throw Object.assign(new Error('当前咨询人数较多，请稍后再试'), { status: 503 });
-    }
-    send('status', {
-      step: 'intent',
-      label: `意图：${fastIntent === 'query_freight' ? '查运费时效（缺城市）' : '查网点（缺城市）'}`,
-      state: 'done'
-    });
-    send('ask_location', {
-      intent: fastIntent,
-      missing: fastIntent === 'query_freight' ? ['destination'] : ['city'],
-      originMemory: memFact ? factDisplay(memFact).value : null,
-      preset: {}
-    });
-    send('done', { intent: fastIntent, mode: 'slot_filling' });
-    return;
-  }
+  // const fastIntent = detectCityIntent(message);
+  // if (fastIntent) {
+  //   const memFact = await recallFact(userId, 'attribute', 'origin_city');
+  //   const stored = await slotstore.putPending(sessionId, {
+  //     threadId: null, // 未进图：提交后按补全结果重新发起一轮对话
+  //     intent: fastIntent,
+  //     originalMessage: message,
+  //     missing: fastIntent === 'query_freight' ? ['destination'] : ['city'],
+  //     createdAt: Date.now()
+  //   });
+  //   if (!stored) {
+  //     throw Object.assign(new Error('当前咨询人数较多，请稍后再试'), { status: 503 });
+  //   }
+  //   send('status', {
+  //     step: 'intent',
+  //     label: `意图：${fastIntent === 'query_freight' ? '查运费时效（缺城市）' : '查网点（缺城市）'}`,
+  //     state: 'done'
+  //   });
+  //   send('ask_location', {
+  //     intent: fastIntent,
+  //     missing: fastIntent === 'query_freight' ? ['destination'] : ['city'],
+  //     originMemory: memFact ? factDisplay(memFact).value : null,
+  //     preset: {}
+  //   });
+  //   send('done', { intent: fastIntent, mode: 'slot_filling' });
+  //   return;
+  // }
 
   await runGraphTurn({ sessionId, userId, send, originalMessage: message, userMessage: message });
 }

@@ -124,6 +124,7 @@ function buildTools({ sessionId, userId, send, originalMessage }) {
         // 缺参时挂起图，前端随即弹出地址选择面板；续跑时 interrupt() 直接返回用户选择，不会再发一次等待状态
         const ask = (payload) => {
           try {
+            console.log('payload',payload)
             return interrupt(payload);
           } catch (err) {
             if (isGraphInterrupt(err)) {

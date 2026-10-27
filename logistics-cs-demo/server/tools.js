@@ -1,20 +1,8 @@
 // ============ Mock 工具：查运单 / 查运费时效 / 查知识库 / 查网点 ============
-import { SHIPMENTS, CITY_INFO, REMOTE_PROVINCES, FREIGHT_PRODUCTS, KNOWLEDGE_BASE, BRANCHES } from './data.js';
+import { SHIPMENTS, CITY_INFO, REMOTE_PROVINCES, FREIGHT_PRODUCTS, BRANCHES } from './data.js';
+import { searchKnowledge } from './knowledge.js';
 
 const delay = (ms) => new Promise((r) => setTimeout(r, ms));
-
-// 知识库检索打分（关键词命中）
-export function scoreKnowledge(m) {
-  const scored = [];
-  for (const entry of KNOWLEDGE_BASE) {
-    let score = 0;
-    for (const k of entry.keywords) {
-      if (m.includes(k)) score += k.length >= 3 ? 3 : 2;
-    }
-    if (score > 0) scored.push({ entry, score });
-  }
-  return scored.sort((a, b) => b.score - a.score);
-}
 
 function resolvePlace(name) {
   if (!name) return null;
@@ -76,15 +64,9 @@ export async function queryFreight({ origin, destination, weightKg } = {}) {
   };
 }
 
-// 工具：知识库检索
+// 工具：知识库检索（RAG 检索平台 API，失败自动降级本地词法检索）
 export async function queryKnowledge({ query = '', topN = 2 } = {}) {
-  await delay(600);
-  const matched = scoreKnowledge(query).slice(0, topN);
-  return {
-    matched,
-    empty: matched.length === 0,
-    summary: matched.length ? `命中 ${matched.length} 条知识` : '知识库未命中'
-  };
+  return searchKnowledge({ query, topN });
 }
 
 // 工具：查询营业网点（支持城市 / 区县 / 省份 + 关键词筛选）

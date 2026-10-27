@@ -8,7 +8,7 @@ LLM（deepseek-chat）根据用户问题自主决策，调用 5 个工具：
 
 - **query_shipment**：查运单状态（轨迹 / 预计送达 / 派送员 / 异常提示）— Mock 运单
 - **query_freight**：估算运费时效（同城 / 省内 / 跨省 / 偏远 线路系数，三档产品）— Mock 计价引擎
-- **query_knowledge**：寄递知识库检索（禁运品 / 包装 / 理赔 / 保价等 8 篇）— 关键词打分检索
+- **query_knowledge**：寄递知识库检索（禁运品 / 包装 / 理赔 / 保价等 8 篇）— 调用独立知识检索平台 API（向量+关键词混合检索、RRF 融合、引用溯源），平台不可用时自动降级本地关键词打分检索
 - **query_branches**：网点查询（按城市 / 区县 / 省份检索营业点与自提点，支持按区县、地标、业务类型筛选）— Mock 网点数据
 - **transfer_human**：转接人工（排队 -> 客服接入 -> 真人回复 -> 结束）— 会话级 SSE 推送
 
@@ -42,6 +42,20 @@ DATABASE_URL=postgres://postgres:postgres@localhost:5432/logistics_cs
 ```bash
 createdb logistics_cs   # 或: psql -c "CREATE DATABASE logistics_cs;"
 ```
+
+### 知识库 RAG 检索平台接入
+
+`query_knowledge` 不再本地检索，改为调用独立的**知识检索平台**（RAG-ai 项目，Fastify，默认 `:3000`，以 `.env` 的 `KNOWLEDGE_API_URL` 为准）：平台侧完成 Query Intelligence（意图分析 / 改写 / 多查询）→ 向量+关键词混合检索（Qdrant + OpenSearch BM25）→ RRF 融合 → 重排 → 生成带 `[n]` 引用的标准答案；Agent 侧拿到 `answer + citations`（chunk 级引用溯源）交给 DeepSeek 组织回复。
+
+```bash
+# 1. 启动平台基础设施与 API（见 RAG-ai 项目 README）
+docker compose up -d && pnpm db:push && pnpm dev & pnpm worker
+
+# 2. 上传知识库（8 篇寄递知识，创建版本并激活，轮询直到索引 ready）
+node scripts/seed-knowledge.js
+```
+
+`.env` 配置：`KNOWLEDGE_API_URL` / `KNOWLEDGE_TENANT_ID` / 可选 `KNOWLEDGE_VERSION_ID`（缺省用平台激活版本）/ `KNOWLEDGE_TIMEOUT_MS`。可用性保障：单次检索超时熔断 + 连续失败打开熔断器（60s 冷却），熔断期间与平台故障时**自动降级为本地关键词打分检索**，知识服务故障不阻断对话链路（降级会在工具结果中标注 `degraded`）。
 
 ### Redis（可选，多实例部署推荐开启）
 
@@ -93,7 +107,8 @@ server/
   agent.js               会话编排：上下文拼装（Prompt + 长期记忆 + 历史）/ 转人工快速路径 / 槽位补全 / 落库与记忆调度 + 每进程并发闸
   graph.js               LangGraph Agent：StateGraph(agent ⇄ tools) + ToolNode + interrupt 槽位补全 + 流式事件映射；PostgresSaver 检查点 + 挂起 thread 注册表/兜底清理
   llm.js                 ChatDeepSeek 封装（读取 .env，temperature 可覆盖）
-  tools.js               业务工具实现（运单/运费/知识库/网点）+ scoreKnowledge
+  tools.js               业务工具实现（运单/运费/知识库/网点）
+  knowledge.js           知识库检索客户端：知识检索平台 API（/search 混合检索+引用）+ 超时熔断 + 本地词法降级
   utils.js               通用小工具（消息取文本 / 截断 / 固定文案模拟流式）
   redis.js               Redis 接入（REDIS_URL 可选）：普通/订阅双连接，未配置则各模块降级进程内存
   slotstore.js           挂起槽位存储：Redis 原生 TTL + GETDEL 原子取出（多实例共享），内存降级 + 每进程容量上限
@@ -108,6 +123,7 @@ server/
   data.js                Mock 数据：知识库 / 运单 / 运费产品 / 网点 / 城市线路
 scripts/
   migrate-memory-json.js 一次性迁移：旧 data/memory.json -> PostgreSQL（npm run migrate:memory）
+  seed-knowledge.js      知识库种子：把 8 篇寄递知识上传到知识检索平台（建版本/激活/上传/轮询索引完成）
   eval.js 六阶段自动化评测：工具调用准确率 / 缺参补全 / 长期记忆 / Recall@8 / 并发压测 / 故障恢复（npm run eval）
 ```
 
